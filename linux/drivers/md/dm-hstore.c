@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2009 Red Hat GmbH. All rights reserved.
+ * Copyright (C) 2009-2010 Red Hat GmbH. All rights reserved.
  *
  * Module Author: Heinz Mauelshagen <heinzm@redhat.com>
  *
@@ -44,7 +44,7 @@
  *
  */
 
-static const char *version = "0.127";
+static const char version[] = "0.139";
 
 #include "dm.h"
 
@@ -69,7 +69,7 @@ static const char *version = "0.127";
 	do { DMERR(x); return ret; } while (0);
 #define	DM_ERR(x...)	DM_ERR_RET(-EINVAL, x)
 
-#define	EXTENT_SECTORS_DEFAULT	to_sector(128*1024)	/* 128KB */
+#define	EXTENT_SECTORS_DEFAULT	to_sector(64*2048)	/* 64KB */
 #define	SECTOR_SIZE		to_bytes(1)	/* Sector size in bytes. */
 
 #define     range_ok(i, min, max)   (i >= min && i <= max)
@@ -80,12 +80,9 @@ static const char *version = "0.127";
  */
 #define	META_SECTORS	to_sector(4096)
 #define	EXTENTS_MIN	1
-#define	MIN_CACHE_SIZE	(8 * 2 * 1024) /* 8MB */
+#define	MIN_CACHE_SIZE	(8*2*1024) /* 8MB */
 
-/* Global hstore multi-threaded workqueue. */
-static struct workqueue_struct *_hstore_wq;
-
-/* A hash. */
+/* A cache hash. */
 struct hash {
 	struct list_head *hash;
 	unsigned buckets;
@@ -182,26 +179,29 @@ static inline int name ## what(struct var *v) \
 
 /* Extent state flags. */
 enum extent_flags {
-	EXTENT_BIO_ACTIVE,	/* Bios active on extent. */
-	EXTENT_BIO_WRITE,	/* Write bios submitted. */
-	EXTENT_COPY_ACTIVE,	/* kcopyd active on extent. */
 	EXTENT_DIRTY,		/* Extent needs writing back to origin. */
+	EXTENT_UPTODATE,	/* Extent data is uptodate. */
 	EXTENT_ERROR,		/* IO error on extent ocurred. */
 	EXTENT_FREE,		/* Extent is available. */
+	/*
+	 * Don't change the order of the previous ones
+	 * because they are persistent in the ondisk metadata!
+	 *
+	 * Those following below are transient.
+	 */
+	EXTENT_BIO_ACTIVE,	/* Bios active on extent. */
+	EXTENT_COPY_ACTIVE,	/* kcopyd active on extent. */
 	EXTENT_META_READ,	/* Extent metadata read. */
-	EXTENT_UPTODATE,	/* Extent data is uptodate. */
-	EXTENT_WRITING_FREE,	/* Writing next free metadata header. */
 };
 
-BITOPS(Extent, BioActive, extent, EXTENT_BIO_ACTIVE)
-BITOPS(Extent, BioWrite, extent, EXTENT_BIO_WRITE)
-BITOPS(Extent, CopyActive, extent, EXTENT_COPY_ACTIVE)
 BITOPS(Extent, Dirty, extent, EXTENT_DIRTY)
+BITOPS(Extent, Uptodate, extent, EXTENT_UPTODATE)
 BITOPS(Extent, Error, extent, EXTENT_ERROR)
 BITOPS(Extent, Free, extent, EXTENT_FREE)
+
+BITOPS(Extent, BioActive, extent, EXTENT_BIO_ACTIVE)
+BITOPS(Extent, CopyActive, extent, EXTENT_COPY_ACTIVE)
 BITOPS(Extent, MetaRead, extent, EXTENT_META_READ)
-BITOPS(Extent, Uptodate, extent, EXTENT_UPTODATE)
-BITOPS(Extent, WritingFree, extent, EXTENT_WRITING_FREE)
 
 /* REMOVEME: */
 /* Development statistics. */
@@ -266,8 +266,6 @@ struct hstore_c {
 	/* Extent hash. */
 	struct hash hash;
 
-	struct extent *extent_mru;	/* Most recently used extent. */
-
 	struct {
 		spinlock_t lock;	/* Protects central input list above. */
 		struct bio_list in;	/* Pending bios (central input list). */
@@ -275,8 +273,8 @@ struct hstore_c {
 		atomic_t ref;	/* IO in flight reference counting. */
 
 		wait_queue_head_t suspendq;	/* Suspend synchronization. */
-		wait_queue_head_t invalidateq;	/* Invalidate synchronization.*/
 
+		struct workqueue_struct *wq; /* Work queue. */
 		struct work_struct ws;	/* IO work. */
 
 		/* IO services used. */
@@ -350,6 +348,7 @@ struct hstore_c {
 /* Cache state flags. */
 enum hstore_c_flags {
 	CACHE_BARRIER,			/* Cache is performing barrier IO. */
+	CACHE_CHANGE,			/* Request a cache property change. */
 	CACHE_CHANGE_PERSISTENCY,	/* Toggle cache persistency. */
 	CACHE_CHANGE_RW,		/* Toggle origin rw access. */
 	CACHE_CHANGE_WRITE_POLICY,	/* Toggle cache write policy. */
@@ -357,16 +356,17 @@ enum hstore_c_flags {
 	CACHE_INITIALIZING,		/* Cache initialization of extents. */
 	CACHE_INITIALIZING_NEW,		/* Write " */
 	CACHE_INITIALIZATION_ACTIVE,	/* Initialization IO active. */
-	CACHE_INVALIDATE,		/* Invalidate cache. */
 	CACHE_PERSISTENT,		/* Cache persistent. */
 	CACHE_RESIZE,			/* Cache resizing. */
 	CACHE_SUSPEND,			/* Cache suspension. */
 	CACHE_WRITE_THROUGH,		/* Write through cache. */
-	CACHE_WRITING_FREE,		/* Writing next free header. */
-	CACHE_THREAD_RUNNING,		/* Thread running. */
+	CACHE_CACHE_IO_QUEUED,		/* IOs to cache device queued. */
+	CACHE_ORIG_IO_QUEUED,		/* IOs to original device queued. */
+	CACHE_NEW_BIOS_QUEUED,		/* New bios queued. */
 };
 
 BITOPS(Cache, Barrier, hstore_c, CACHE_BARRIER)
+BITOPS(Cache, Change, hstore_c, CACHE_CHANGE)
 BITOPS(Cache, ChangePersistency, hstore_c, CACHE_CHANGE_PERSISTENCY)
 BITOPS(Cache, ChangeRW, hstore_c, CACHE_CHANGE_RW)
 BITOPS(Cache, ChangeWritePolicy, hstore_c, CACHE_CHANGE_WRITE_POLICY)
@@ -374,13 +374,13 @@ BITOPS(Cache, DirtyFlushing, hstore_c, CACHE_DIRTY_FLUSHING)
 BITOPS(Cache, Initializing, hstore_c, CACHE_INITIALIZING)
 BITOPS(Cache, InitializingNew, hstore_c, CACHE_INITIALIZING_NEW)
 BITOPS(Cache, InitializationActive, hstore_c, CACHE_INITIALIZATION_ACTIVE)
-BITOPS(Cache, Invalidate, hstore_c, CACHE_INVALIDATE)
 BITOPS(Cache, Persistent, hstore_c, CACHE_PERSISTENT)
 BITOPS(Cache, Resize, hstore_c, CACHE_RESIZE)
 BITOPS(Cache, Suspend, hstore_c, CACHE_SUSPEND)
 BITOPS(Cache, WriteThrough, hstore_c, CACHE_WRITE_THROUGH)
-BITOPS(Cache, WritingFree, hstore_c, CACHE_WRITING_FREE)
-BITOPS(Cache, ThreadRunning, hstore_c, CACHE_THREAD_RUNNING)
+BITOPS(Cache, CacheIOQueued, hstore_c, CACHE_CACHE_IO_QUEUED)
+BITOPS(Cache, OrigIOQueued, hstore_c, CACHE_ORIG_IO_QUEUED)
+BITOPS(Cache, NewBiosQueued, hstore_c, CACHE_NEW_BIOS_QUEUED)
 #undef BITOPS
 /*
  * Disk metadata sectors alloc/free.
@@ -390,9 +390,10 @@ static void *metadata_alloc(struct hstore_c *hc)
 	return mempool_alloc(hc->io.metadata_pool, GFP_NOIO);
 }
 
-static void metadata_free(struct hstore_c *hc, void *disk_header)
+static void metadata_free(struct hstore_c *hc, void **disk_header)
 {
-	mempool_free(disk_header, hc->io.metadata_pool);
+	mempool_free(*disk_header, hc->io.metadata_pool);
+	*disk_header = NULL;
 }
 
 /*
@@ -411,6 +412,7 @@ static void *extent_alloc(struct hstore_c *hc, gfp_t flags)
 		INIT_LIST_HEAD(&extent->lists.endio_flush);
 		INIT_LIST_HEAD(&extent->lists.hash);
 		INIT_LIST_HEAD(&extent->lists.init_lru);
+		atomic_set(&extent->lists.endio_ref, 0);
 	}
 
 	return extent;
@@ -419,12 +421,6 @@ static void *extent_alloc(struct hstore_c *hc, gfp_t flags)
 static void extent_free(struct extent *extent)
 {
 	kfree(extent);
-}
-
-/* Return extent for position in init/LRU list. */
-static inline struct extent *extent_pos(struct list_head *pos)
-{
-	return list_entry(pos, struct extent, lists.init_lru);
 }
 
 /* Return extent size (extent sectors + metadata sectors). */
@@ -465,18 +461,17 @@ static int cc_ios_inflight(struct hstore_c *hc)
 	       !list_empty(&hc->lists.flush);
 }
 
-/* Check cache clean (ie. all got flushed but deferred input io) */
-static int cc_cache_clean(struct hstore_c *hc)
-{
-	return !cc_ios_inflight(hc) && list_empty(&hc->lists.dirty);
-}
-
 /* Check cache idle. */
 static int cc_idle(struct hstore_c *hc)
 {
-	return !cc_ios_inflight(hc) &&
-	       bio_list_empty(&hc->io.defer) &&
-	       bio_list_empty(&hc->io.in);
+	int r = !cc_ios_inflight(hc) &&
+		bio_list_empty(&hc->io.defer);
+
+	spin_lock_irq(&hc->io.lock);
+	r &= bio_list_empty(&hc->io.in);
+	spin_unlock_irq(&hc->io.lock);
+
+	return r;
 }
 
 /* Derive hash key from bio sector. */
@@ -515,7 +510,7 @@ static inline void bio_remap(struct extent *extent, struct bio *bio)
 static int hash_init(struct hstore_c *hc)
 {
 	unsigned buckets;
-	sector_t extents = extents_total(hc);
+	sector_t extents = atomic_read(&hc->extents.total);
 	struct hash *hash = &hc->hash;
 
 	/* 32 entries per bucket average. */
@@ -576,7 +571,7 @@ static struct extent *hash_lookup(struct hstore_c *hc, sector_t key)
 static void do_hstore(struct work_struct *ws);
 static void wake_do_hstore(struct hstore_c *hc)
 {
-	queue_work(_hstore_wq, &hc->io.ws);
+	queue_work(hc->io.wq, &hc->io.ws);
 }
 
 /* Get an IO reference for endio processing. */
@@ -584,6 +579,32 @@ static inline void endio_get(struct extent *extent)
 {
 	atomic_inc(&extent->hc->io.ref);
 	atomic_inc(&extent->lists.endio_ref);
+}
+
+/* Push an extent to the end of the endio list. */
+static void endio_put(struct extent *extent)
+{
+	int wake = 0;
+	struct hstore_c *hc = extent->hc;
+
+	/* Push to the list in case last IO reference gets dropped. */
+	if (atomic_dec_and_test(&extent->lists.endio_ref)) {
+		unsigned long flags;
+
+		/* Put extent on endio list for worker to handle. */
+		spin_lock_irqsave(&hc->lists.locks.endio, flags);
+		BUG_ON(!list_empty(&extent->lists.endio_flush));
+		list_add_tail(&extent->lists.endio_flush, &hc->lists.endio);
+		spin_unlock_irqrestore(&hc->lists.locks.endio, flags);
+
+		wake = 1;
+	}
+
+	atomic_dec(&hc->io.ref);
+
+	if (wake)
+		/* Wakeup worker to deal with endio list. */
+		wake_do_hstore(hc);
 }
 
 /* Transfer core extent representation to disk. */
@@ -631,65 +652,38 @@ static int extent_check(struct extent *extent, sector_t offset)
 	return 0;
 }
 
-/* Push an extent to the end of the endio list. */
-static void endio_put(struct extent *extent)
+/* Pop an extent off the given endio or flush list. */
+static struct extent *_extent_pop(struct list_head *list)
 {
-	struct hstore_c *hc = extent->hc;
+	struct extent *extent;
 
-	/* Push to the list in case last IO reference gets dropped. */
-	if (atomic_dec_and_test(&extent->lists.endio_ref)) {
-		int wake;
-		unsigned long flags;
-
-		/* Put extent on endio list for worker to handle. */
-		spin_lock_irqsave(&hc->lists.locks.endio, flags);
-		BUG_ON(!list_empty(&extent->lists.endio_flush));
-		wake = list_empty(&extent->lists.endio_flush);
-		if (wake)
-			list_add_tail(&extent->lists.endio_flush,
-				      &hc->lists.endio);
-		spin_unlock_irqrestore(&hc->lists.locks.endio, flags);
-
-		/* Wakeup worker to deal with endio list. */
-		if (wake)
-			wake_do_hstore(hc);
+	if (list_empty(list))
+		extent = NULL;
+	else {
+		extent = list_first_entry(list,
+					  struct extent, lists.endio_flush);
+		list_del_init(&extent->lists.endio_flush);
 	}
 
-	atomic_dec(&hc->io.ref);
+	return extent;
 }
 
-/* Pop an extent off the endio list. */
+/* Pop an extent off the endio list locked vs. endio routine. */
 static struct extent *extent_endio_pop(struct hstore_c *hc)
 {
 	struct extent *extent;
 
 	spin_lock_irq(&hc->lists.locks.endio);
-	if (list_empty(&hc->lists.endio))
-		extent = NULL;
-	else {
-		extent = list_first_entry(&hc->lists.endio,
-					  struct extent, lists.endio_flush);
-		list_del_init(&extent->lists.endio_flush);
-	}
-
+	extent = _extent_pop(&hc->lists.endio);
 	spin_unlock_irq(&hc->lists.locks.endio);
+
 	return extent;
 }
 
 /* Pop an extent off the flush list. */
 static struct extent *extent_flush_pop(struct hstore_c *hc)
 {
-	struct extent *extent;
-
-	if (list_empty(&hc->lists.flush))
-		extent = NULL;
-	else {
-		extent = list_first_entry(&hc->lists.flush,
-					  struct extent, lists.endio_flush);
-		list_del_init(&extent->lists.endio_flush);
-	}
-
-	return extent;
+	return _extent_pop(&hc->lists.flush);
 }
 
 /* Pop an extent off the init list. */
@@ -743,6 +737,7 @@ static int io(struct hstore_c *hc, void *ptr, unsigned count,
 		.client = hc->io.dm_io_client,
 	};
 
+	SetCacheCacheIOQueued(hc);
 	return dm_io(&control, 1, &region, NULL);
 }
 
@@ -824,7 +819,6 @@ static int header_write(struct hstore_c *hc)
 	header_to_disk(hc);
 	r = header_io(hc, WRITE);
 	header_to_cpu(hc);
-
 	return r;
 }
 
@@ -853,20 +847,13 @@ static void extent_init(struct hstore_c *hc, struct extent *extent,
 	SetExtentFree(extent);
 }
 
-/* End IO a bio. */
-static inline void _bio_endio(struct bio *bio, int error)
-{
-	/* bio_endio(bio, bio->bi_size, error); */
-	bio_endio(bio, error);
-}
-
 /* bio_endio() a bio_list .*/
 static void _bio_endio_list(struct bio_list *list, int error)
 {
 	struct bio *bio;
 
 	while ((bio = bio_list_pop(list)))
-		_bio_endio(bio, error);
+		bio_endio(bio, error);
 }
 
 /* Add an element to a list safely. */
@@ -893,6 +880,8 @@ static inline void extent_init_add(struct extent *extent)
 /* Add extent to end of dirty list. */
 static inline void extent_dirty_add(struct extent *extent)
 {
+	/* REMOVEME: statistics */
+	atomic_inc(&extent->hc->stats.extent_dirty);
 	_extent_add(&extent->lists.dirty, &extent->hc->lists.dirty);
 }
 
@@ -923,7 +912,9 @@ struct extent *extent_lru_pop(struct hstore_c *hc)
 	struct extent *extent;
 
 	spin_lock_irq(&lists->locks.lru);
-	if (list_empty(&hc->lists.lru))
+	if (list_empty(&hc->lists.lru) ||
+	    (CacheInitializingNew(hc) &&
+	     &hc->lists.lru == hc->lists.lru.next->next))
 		extent = NULL;
 	else {
 		extent = list_first_entry(&hc->lists.lru,
@@ -960,35 +951,10 @@ static inline int OrigWritable(struct hstore_c *hc)
 	return hc->devs.orig.mode & FMODE_WRITE;
 }
 
-/*
- * Write the next free extent metadata header in
- * case a free one got allocated from the LRU list.
- */
-static void write_free_header(struct hstore_c *hc)
-{
-	struct extent *extent;
-
-	/* The LRU list may not be empty to write another free extent. */
-	BUG_ON(list_empty(&hc->lists.lru));
-	extent = extent_pos(hc->lists.lru.next);
-	BUG_ON(!ExtentFree(extent));
-
-	/* REMOVEME: statistics */
-	atomic_inc(&hc->stats.write_free);
-	extent->disk = metadata_alloc(hc);
-	extent_to_disk(extent);
-	SetExtentWritingFree(extent);
-	SetCacheWritingFree(hc);
-
-	/* Take out metadata IO reference. */
-	endio_get(extent);
-	BUG_ON(extent_meta_io(hc, extent, WRITE));
-}
-
 /* Try to get an extent either from the hash or off the LRU list. */
 static struct extent *extent_get(struct hstore_c *hc, struct bio *bio)
 {
-	/* key is relative (0 based) start address of extent on origin. */
+	/* Key is relative (0 based) start address of extent on origin. */
 	sector_t key = _bio_to_key(hc, bio);
 	struct extent *extent;
 
@@ -1004,35 +970,13 @@ static struct extent *extent_get(struct hstore_c *hc, struct bio *bio)
 		goto out;
 	}
 
-	/*
-	 * Don't try fetching an extent from the LRU list and
-	 * write a new free one while we're still initializing.
-	 */
-	if (CacheInitializing(hc))
-		goto out;
-
-	/*
-	 * Can't fetch another free extent off the LRU list and
-	 * order the following free extent metadata to be written
-	 * out while another extents metadata IO is still active.
-	 */
-	if (CacheWritingFree(hc)) {
-		/* REMOVEME: statistics */
-		atomic_inc(&hc->stats.writing_free);
-		goto out;
-	}
-
 	/* Try to fetch an extent off the LRU list. */
 	extent = extent_lru_pop(hc);
 	if (extent) {
 		/* REMOVEME: */
 		BUG_ON(!bio_list_empty(&extent->io.in));
-
-		if (TestClearExtentFree(extent) &&
-		    CachePersistent(hc) &&
-		    !atomic_dec_and_test(&hc->extents.free))
-			/* Write next free extent header */
-			write_free_header(hc);
+		BUG_ON(ExtentBioActive(extent));
+		BUG_ON(ExtentCopyActive(extent));
 
 		/*
 		 * Clear state flags but error, because the extent
@@ -1070,31 +1014,22 @@ static int extent_data_io(struct hstore_c *hc, struct extent *extent, int rw)
 
 	rw == READ ? (from = &orig,  to = &cache) :
 		     (from = &cache, to = &orig);
+
+	SetCacheCacheIOQueued(hc);
+	SetCacheOrigIOQueued(hc);
 	return dm_kcopyd_copy(hc->io.kcopyd_client, from, 1, to, 0,
 			      kcopy_endio, extent);
 }
 
-/* Check if the actual extent is invalid. */
-static struct extent *extent_valid(struct extent *extent,
-					  struct bio *bio)
+/* Defer bio list and bio when no extents available and update statistics. */
+static void _bio_list_defer(struct hstore_c *hc, struct bio_list *ios,
+			    struct bio *bio)
 {
-	if (extent &&
-	    extent->hc->devs.orig.start + _bio_to_key(extent->hc, bio) ==
-	    extent->addr.orig.offset) {
-		/* REMOVEME: statistics */
-		atomic_inc(&extent->hc->stats.extent_valid);
-		return extent;
-	}
+	bio_list_add(&hc->io.defer, bio);
+	bio_list_merge(&hc->io.defer, ios);
 
-	return NULL;
-}
-
-/* Defer bios when no extents available and update statistics. */
-static void _bio_defer(struct hstore_c *hc, struct bio *bio)
-{
 	/* REMOVEME: statistics */
 	atomic_inc(hc->stats.deferred_io + (bio_data_dir(bio) == WRITE));
-	bio_list_add(&hc->io.defer, bio);
 }
 
 /*
@@ -1103,37 +1038,34 @@ static void _bio_defer(struct hstore_c *hc, struct bio *bio)
  */
 static void do_settings(struct hstore_c *hc)
 {
-	int r = 0;
+	if (TestClearCacheChange(hc)) {
+		int r = 0;
+	
+		if (TestClearCacheChangePersistency(hc)) {
+			CachePersistent(hc) ? ClearCachePersistent(hc) :
+					      SetCachePersistent(hc);
+			r++;
+		}
+	
+		if (TestClearCacheChangeRW(hc)) {
+			if (OrigWritable(hc))
+				hc->devs.orig.mode &= ~FMODE_WRITE;
+			else
+				hc->devs.orig.mode |= FMODE_WRITE;
 
-	if (TestClearCacheChangePersistency(hc)) {
-		if (CachePersistent(hc))
-			ClearCachePersistent(hc);
-		else
-			SetCachePersistent(hc);
-
-		r++;
+			r++;
+		}
+	
+		if (TestClearCacheChangeWritePolicy(hc)) {
+			CacheWriteThrough(hc) ? ClearCacheWriteThrough(hc) :
+						SetCacheWriteThrough(hc);
+			r++;
+		}
+	
+		/* If any state changed -> update cache header. */
+		if (r && CachePersistent(hc))
+			header_write(hc);
 	}
-
-	if (TestClearCacheChangeRW(hc)) {
-		if (OrigWritable(hc))
-			hc->devs.orig.mode &= ~FMODE_WRITE;
-		else
-			hc->devs.orig.mode |= FMODE_WRITE;
-
-		r++;
-	}
-
-	if (TestClearCacheChangeWritePolicy(hc)) {
-		if (CacheWriteThrough(hc))
-			ClearCacheWriteThrough(hc);
-		else
-			SetCacheWriteThrough(hc);
-
-		r++;
-	}
-
-	if (r && CachePersistent(hc))
-		header_write(hc);
 }
 
 /*
@@ -1152,15 +1084,16 @@ static void extent_io(struct hstore_c *hc, struct extent *extent, int rw)
 	 * to it and restore them (they will get updated in do_endios()).
 	 */
 	if (CachePersistent(hc)) {
-		/* Save flags to restore. */
+		/* Save in core flags to restore. */
 		unsigned long flags = extent->io.flags;
 
+		/* Adjust flags for disk representation. */
 		rw == READ ? SetExtentUptodate(extent) :
 			     ClearExtentDirty(extent);
 		extent->disk = metadata_alloc(hc);
 		extent_to_disk(extent);
 
-		/* Restore flags. */
+		/* Restore in core flags. */
 		extent->io.flags = flags;
 
 		/* Take out a references for the metadata IOs. */
@@ -1182,30 +1115,45 @@ static void extent_io(struct hstore_c *hc, struct extent *extent, int rw)
 /* Process bios on an uptodate extent. */
 static void bios_io(struct hstore_c *hc, struct extent *extent)
 {
-	int meta_io = 1, writes = 0;
+	int writes = 0;
 	struct bio *bio;
 	struct bio_list *bl = &extent->io.in;
 
-	/* Loop through bio_list first, taking out the endio references. */
-	bio_list_for_each(bio, bl) {
-		int write = bio_data_dir(bio) == WRITE;
+if (ExtentBioActive(extent))
+	return;
+
+_extent_del(&extent->lists.endio_flush);
+
+	/* Take an io reference against premature endio. */
+	endio_get(extent);
+
+	/* Flag bio IO active on this extent. */
+	SetExtentBioActive(extent);
+
+	/*
+	 * Remap all queued bios, take out an endio
+	 * reference per bio and submit them.
+	 */
+	while ((bio = bio_list_pop(bl))) {
+		int write = !!(bio_data_dir(bio) == WRITE);
 
 		writes += write;
-		endio_get(extent);	/* Take an io reference per bio. */
 		bio_remap(extent, bio);	/* Remap to cache or orig device. */
+		endio_get(extent);	/* Take an io reference per bio. */
+		SetCacheCacheIOQueued(hc);
+		generic_make_request(bio);
 
 		/* REMOVEME: statistics. */
 		atomic_inc(hc->stats.submitted_io + write);
 	}
-
-	/* Flag bio IO active on this extent. */
-	SetExtentBioActive(extent);
 
 	/*
 	 * If I've got writes here *and* the extent hasn't been
 	 * dirtied in a previous run -> update metadata on disk.
 	 */
 	if (writes) {
+		int meta_io = 1;
+
 		if (CacheWriteThrough(hc)) {
 			/* REMOVEME: statistics */
 			atomic_inc(&hc->stats.extent_clear_uptodate);
@@ -1217,15 +1165,10 @@ static void bios_io(struct hstore_c *hc, struct extent *extent)
 			if (!TestClearExtentUptodate(extent))
 				/* Write metadata only on first change. */
 				meta_io = 0;
-		} else if (!TestSetExtentDirty(extent)) {
-			/* REMOVEME: statistics */
-			atomic_inc(&hc->stats.extent_dirty);
+		} else if (!TestSetExtentDirty(extent))
 			extent_dirty_add(extent);
-		}
 
 		/* Update metadata of this extent on cache device. */
-		SetExtentBioWrite(extent);
-
 		if (CachePersistent(hc) && meta_io) {
 			extent->disk = metadata_alloc(hc);
 			extent_to_disk(extent);
@@ -1235,42 +1178,37 @@ static void bios_io(struct hstore_c *hc, struct extent *extent)
 		}
 	}
 
-	/* Submit all bios hanging off the extents input list. */
-	while ((bio = bio_list_pop(bl)))
-		generic_make_request(bio);
+	/* Releases reference against premature endio. */
+	endio_put(extent);
 }
 
-/* Set extents to validated and put them onto the LRU list. */
-static void extents_validate_init(struct hstore_c *hc,
-				  struct extent *extent)
+/*
+ * Set all extents to initialize to
+ * validated and put them onto the LRU list.
+ */
+static void extents_validate_init(struct hstore_c *hc, struct extent *extent)
 {
-	LIST_HEAD(free);
-
 	do {
 		atomic_inc(&hc->extents.free);
 		atomic_inc(&hc->extents.initialized);
-		list_add_tail(&extent->lists.init_lru, &free);
+		extent_lru_add(extent);
 	} while ((extent = extent_init_pop(hc)));
-
-	list_splice(&free, &hc->lists.lru);
 }
 
-/* Validate extents. */
+/* Validate extents on cache initialization. */
 static void extent_validate(struct hstore_c *hc, struct extent *extent)
 {
-	/*
-	 * Metadata read -> insert into hash if used, so
-	 * that hash hits can start to happen in do_bios().
-	 */
 	/* Reset to enable access. */
 	ClearExtentBioActive(extent);
-	ClearExtentBioWrite(extent);
 	ClearExtentCopyActive(extent);
-	ClearExtentWritingFree(extent);
 
 	if (ExtentError(extent))
 		DMERR("extent=%llu metadata read error",
 	      	      (unsigned long long) extent->addr.cache.offset);
+	/*
+	 * Metadata read -> insert into hash if used, so
+	 * that hash hits can start to happen in do_bios()->extent_get().
+	 */
 	else if (!ExtentFree(extent)) {
 		/* Insert into hash if used. */
 		extent_insert(extent);
@@ -1281,27 +1219,26 @@ static void extent_validate(struct hstore_c *hc, struct extent *extent)
 		 */
 		if (!ExtentUptodate(extent))
 			extent_flush_add(extent);
-		else if (ExtentDirty(extent)) {
-			/* REMOVEME: statistics */
-			atomic_inc(&hc->stats.extent_dirty);
+		else if (ExtentDirty(extent))
 			extent_dirty_add(extent);
-		}
 	}
 
-	/* Put on LRU list if errored or uptodate and clean. */
-	if ((ExtentUptodate(extent) && !ExtentDirty(extent)) ||
-	    ExtentError(extent))
-		extent_lru_add(extent);
+	extent_lru_add(extent);
 
 	/*
-	 * A free extent got written or read -> we can
-	 * validate all other extents on the init list
-	 * and put them upfront the LRU list.
+	 * A free extent got read -> we can validate
+	 * all other extents on the init list
+	 * and put them on the LRU list.
 	 */
-	if (ExtentFree(extent))
-		extents_validate_init(hc, extent);
-	else
+	if (ExtentMetaRead(extent)) {
+		if (ExtentFree(extent))
+			extents_validate_init(hc, extent);
+		else
+			atomic_inc(&hc->extents.initialized);
+	} else {
+		atomic_inc(&hc->extents.free);
 		atomic_inc(&hc->extents.initialized);
+	}
 
 	/* All extents done. */
 	if (atomic_read(&hc->extents.initialized) ==
@@ -1314,12 +1251,6 @@ static void extent_validate(struct hstore_c *hc, struct extent *extent)
 		       atomic_read(&hc->extents.total),
 		       atomic_read(&hc->extents.free));
 	}
-
-	/*
-	 * Flag initialization of extent done, so
-	 * that another one can be read if necessary.
-	 */
-	ClearCacheInitializationActive(hc);
 }
 
 /* Handle all endios on extents. */
@@ -1328,6 +1259,7 @@ static void do_endios(struct hstore_c *hc)
 	struct extent *extent;
 
 	while ((extent = extent_endio_pop(hc))) {
+		/* If present, a metadata IO has happened. */
 		if (extent->disk) {
 			/* Transfer metadata to CPU on read. */
 			if (ExtentMetaRead(extent)) {
@@ -1339,8 +1271,8 @@ static void do_endios(struct hstore_c *hc)
 				 * transient and got overwritten from disk.
 				 */
 				extent_to_core(extent);
-				SetExtentMetaRead(extent);
 				r = extent_check(extent, offset);
+				SetExtentMetaRead(extent);
 				if (r) {
 					/* Restore in case of error. */
 					extent->addr.cache.offset = offset;
@@ -1349,17 +1281,17 @@ static void do_endios(struct hstore_c *hc)
 			}
 
 			/* Free disk header structure. */
-			metadata_free(hc, extent->disk);
-			extent->disk = NULL;
+			metadata_free(hc, (void **) &extent->disk);
 
-			/* Extent validation during initialization. */
-			if (unlikely(TestClearExtentMetaRead(extent))) {
+			if (TestClearCacheInitializationActive(hc)) {
 				extent_validate(hc, extent);
 				continue;
 			}
 		}
 
-		/* From hereon, we've got bio writes or extent copies. */
+		/*
+		 * From here, we've got bio writes or extent copies.
+		 */
 
 		/* Adjust extent state, if this was an extent copy. */
 		if (TestClearExtentCopyActive(extent)) {
@@ -1374,17 +1306,12 @@ static void do_endios(struct hstore_c *hc)
 				/* REMOVEME: statistics. */
 				atomic_dec(&hc->stats.extent_dirty);
 			}
-		} else if (TestClearExtentBioActive(extent)) {
-			/* End IO any bios *after* the metadata got updated. */
+		} else if (TestClearExtentBioActive(extent))
+			/* End IO any writes *after* the metadata got updated.*/
 			_bio_endio_list(&extent->io.endio,
 					ExtentError(extent) ? -EIO : 0);
-			ClearExtentBioWrite(extent);
-		}
 
-		/* Clear free extent metadata writes. */
-		if (TestClearExtentWritingFree(extent))
-			ClearCacheWritingFree(hc);
-		else if (bio_list_empty(&extent->io.in)) {
+		if (bio_list_empty(&extent->io.in)) {
 			if (!ExtentDirty(extent))
 				/* No bios and not dirty -> put on LRU list. */
 				extent_lru_add(extent);
@@ -1397,8 +1324,8 @@ static void do_endios(struct hstore_c *hc)
 /* Initialize any extents on init list or resize cache. */
 static void do_extents_init(struct hstore_c *hc)
 {
-	if (CacheInitializationActive(hc) ||
-	    !CacheInitializing(hc) ||
+	if (!CacheInitializing(hc) ||
+	    CacheInitializationActive(hc) ||
 	    CacheSuspend(hc))
 		return;
 	else {
@@ -1408,6 +1335,7 @@ static void do_extents_init(struct hstore_c *hc)
 
 		BUG_ON(!extent);
 		extent->disk = metadata_alloc(hc);
+		BUG_ON(!extent->disk);
 
 		if (rw == WRITE) {
 			ClearExtentMetaRead(extent);
@@ -1415,9 +1343,10 @@ static void do_extents_init(struct hstore_c *hc)
 		} else
 			SetExtentMetaRead(extent);
 
+		SetCacheInitializationActive(hc);
+
 		/* Take endio reference out and initiate IO. */
 		endio_get(extent);
-		SetCacheInitializationActive(hc);
 		BUG_ON(extent_meta_io(hc, extent, rw));
 	}
 }
@@ -1449,7 +1378,7 @@ static void bio_restore_context(struct bio *bio, struct extent *extent)
 static void _bio_restore_and_error(struct bio *bio)
 {
 	bio_restore_context(bio, NULL);
-	_bio_endio(bio, -EIO);
+	bio_endio(bio, -EIO);
 }
 
 /*
@@ -1461,6 +1390,8 @@ static void _bio_restore_and_error(struct bio *bio)
  *     onto flush list unless extent is active (do_endios() will
  *     put those on flush list).
  */
+
+/* I can initiate multiple extent copies at once -> ordering!!!! */
 static void do_bios(struct hstore_c *hc)
 {
 	int need_to_error;
@@ -1468,16 +1399,20 @@ static void do_bios(struct hstore_c *hc)
 	struct bio_list ios;
 	struct extent *extent;
 
+	/* Any bios to work on? */
+	if (!TestClearCacheNewBiosQueued(hc) &&
+	    bio_list_empty(&hc->io.defer))
+		return;
+
 	/* When invalidating the cache or handling a barrier -> wait. */
-	if (CacheInvalidate(hc) ||
-	    (CacheBarrier(hc) && cc_ios_inflight(hc)))
+	if (CacheBarrier(hc) && cc_ios_inflight(hc))
 		return;
 
 	ClearCacheBarrier(hc);
 
 	/*
 	 * In case the original device isn't writable
-	 * and the cache is full, I got to error the IO
+	 * and the cache is full, I got to error the IO.
 	 */
 	need_to_error = !OrigWritable(hc) &&
 			list_empty(&hc->lists.lru) &&
@@ -1494,37 +1429,21 @@ static void do_bios(struct hstore_c *hc)
 	bio_list_init(&hc->io.in);
 	spin_unlock_irq(&hc->io.lock);
 
-	/* Got to make sure, that this is the MRU extent still. */
-	extent = hc->extent_mru;
-	if (extent && !list_empty(&extent->lists.init_lru))
-		extent = NULL;
-
 	/* Work all deferred or new bios on work list. */
 	while ((bio = bio_list_pop(&ios))) {
 		/* Once the barrier is flagged, defer further IO. */
 		if (CacheBarrier(hc)) {
-			_bio_defer(hc, bio);
-			continue;
+			_bio_list_defer(hc, &ios, bio);
+			break;
 		}
 
 		/* Flag a barrier write. */
 		if (bio_empty_barrier(bio))
 			SetCacheBarrier(hc);
 
-		/*
-		 * Check single MRU extent cache entry valid.
-		 * On miss, try getting an extent from hash or LRU list.
-		 */
-		extent = extent_valid(extent, bio);
-		if (!extent)
-			extent = extent_get(hc, bio);
-
-		if (extent)
-			/* REMOVEME: statistics */
-			atomic_inc(&hc->stats.hits);
-
-		/* Can't get one -> put IO off (or error it; see below). */
-		else {
+		/* If I can't get one -> put IO off (or error it; see below). */
+		extent = extent_get(hc, bio);
+		if (!extent) {
 			/* REMOVEME: statistics */
 			atomic_inc(&hc->stats.misses);
 
@@ -1534,13 +1453,21 @@ static void do_bios(struct hstore_c *hc)
 			 * to error the IO (restoring private bio context
 			 * before) unless we're initializing still.
 			 */
-			if (need_to_error)
+			if (need_to_error) {
 				_bio_restore_and_error(bio);
-			else
-				_bio_defer(hc, bio);
-
-			continue;
+				continue;
+			} else {
+				_bio_list_defer(hc, &ios, bio);
+				break;
+			}
 		}
+
+		/*
+		 * Got an extent.
+		 */
+
+		/* REMOVEME: statistics */
+		atomic_inc(&hc->stats.hits);
 
 		/*
 		 * If extent is errored, error bio here,
@@ -1566,15 +1493,13 @@ static void do_bios(struct hstore_c *hc)
 		 *
 		 */
 		if (ExtentBioActive(extent) || ExtentCopyActive(extent))
+		// if (ExtentCopyActive(extent))
 			/* REMOVEME: statistics */
 			atomic_inc(&hc->stats.extent_copy_active);
 		else
 			/* Put extent on flush list for IO. */
 			extent_flush_add(extent);
 	}
-
-	/* Preserve MRU extent reference. */
-	hc->extent_mru = extent;
 }
 
 /*
@@ -1587,7 +1512,7 @@ static void do_overwrite_check(struct hstore_c *hc)
 	struct extent *extent;
 
 	list_for_each_entry(extent, &hc->lists.flush, lists.endio_flush) {
-		/* Skip any uptodate extents. */
+		/* Skip any uptodate or being copied extents. */
 		if (!ExtentUptodate(extent) &&
 		    !ExtentCopyActive(extent)) {
 			unsigned sectors = 0;
@@ -1631,9 +1556,11 @@ static void do_dirty(struct hstore_c *hc)
 		list_for_each_entry_safe(extent, tmp, &hc->lists.dirty,
 					 lists.dirty) {
 			/* Don't initiate IO on active extent. */
-			if (ExtentBioActive(extent) ||
-			    !bio_list_empty(&extent->io.in))
+			if (ExtentBioActive(extent))
+			    // !bio_list_empty(&extent->io.in))
 				continue;
+
+			BUG_ON(ExtentCopyActive(extent));
 
 			/* Flag that we're flushing a dirty extent. */
 			SetCacheDirtyFlushing(hc);
@@ -1653,6 +1580,9 @@ static void do_flush(struct hstore_c *hc)
 
 	/* Work all extents on flush list. */
 	while ((extent = extent_flush_pop(hc))) {
+		// BUG_ON(ExtentBioActive(extent) || ExtentCopyActive(extent));
+		BUG_ON(ExtentCopyActive(extent));
+
 		if (ExtentUptodate(extent)) {
 			/*
 			 * Extent is uptodate; we can write it
@@ -1667,10 +1597,24 @@ static void do_flush(struct hstore_c *hc)
 				bios_io(hc, extent);
 		} else {
 			BUG_ON(ExtentDirty(extent));
-			/* If the extent isn't uptodate -> read it in. */
+			/*
+			 * If the extent isn't uptodate ->
+			 * read it in and update extent metadata.
+			 */
 			extent_io(hc, extent, READ);
 		}
 	}
+}
+
+/* Unplug: let any queued io role on the cache and/or origin devices. */
+static void do_unplug(struct hstore_c *hc)
+{
+	if (TestClearCacheCacheIOQueued(hc))
+		blk_unplug(bdev_get_queue(hc->devs.cache.dev->bdev));
+
+	if (TestClearCacheOrigIOQueued(hc))
+		blk_unplug(bdev_get_queue(hc->devs.orig.dev->bdev));
+
 }
 
 /* Wake up any waiters in case we're idle. */
@@ -1679,10 +1623,6 @@ static void do_wake(struct hstore_c *hc)
 	/* Wake up any suspend waiter. */
 	if (cc_idle(hc))
 		wake_up(&hc->io.suspendq);
-
-	/* Wake up any cache invalidation waiter. */
-	if (cc_cache_clean(hc))
-		wake_up(&hc->io.invalidateq);
 }
 
 /*
@@ -1704,20 +1644,20 @@ static void do_hstore(struct work_struct *ws)
 {
 	struct hstore_c *hc = container_of(ws, struct hstore_c, io.ws);
 
-	if (TestSetCacheThreadRunning(hc))
-		DMERR("%s Recalled!!!", __func__);
-	else {
-		do_settings(hc);
-		do_endios(hc);
-		do_extents_init(hc);
-		do_cache_resize(hc);
-		do_bios(hc);
-		do_overwrite_check(hc);
-		do_dirty(hc);
-		do_flush(hc);
-		do_wake(hc);
-		ClearCacheThreadRunning(hc);
-	}
+	do_settings(hc);
+	do_endios(hc);
+	do_flush(hc);
+	do_unplug(hc);
+	do_extents_init(hc);
+	do_cache_resize(hc);
+	do_bios(hc);
+	do_flush(hc);
+	do_unplug(hc);
+	do_overwrite_check(hc);
+	do_dirty(hc);
+	do_flush(hc);
+	do_unplug(hc);
+	do_wake(hc);
 }
 
 /* Free a list of cache extents structures. */
@@ -1727,11 +1667,11 @@ static void extents_free_list(struct list_head *list)
 
 	list_for_each_safe(pos, tmp, list) {
 		list_del(pos);
-		extent_free(extent_pos(pos));
+		extent_free(list_entry(pos, struct extent, lists.init_lru));
 	}
 }
 
-/* Free the LRU list. */
+/* Free the INIT and LRU lists. */
 static void hstore_extents_free(struct hstore_c *hc)
 {
 	extents_free_list(&hc->lists.init);
@@ -1817,8 +1757,7 @@ static int cache_header_init(struct hstore_c *hc, enum handle_type handle)
 	hc->extent_mask = ~hc->extent_mask_inv;
 
 err:
-	metadata_free(hc, hc->disk_header);
-	hc->disk_header = NULL;
+	metadata_free(hc, (void **) &hc->disk_header);
 	return r;
 }
 
@@ -1829,7 +1768,11 @@ static void hstore_dtr(struct dm_target *ti)
 {
 	struct hstore_c *hc = ti->private;
 
-	flush_workqueue(_hstore_wq);
+	if (!hc)
+		return;
+
+	if (hc->io.wq)
+		destroy_workqueue(hc->io.wq);
 
 	hstore_extents_free(hc);
 	hash_exit(&hc->hash);
@@ -1866,10 +1809,15 @@ static int get_dev(struct dm_target *ti, char **argv, struct c_dev *dev)
 	if (dev->start >= dev->size - MIN_CACHE_SIZE)
 		TI_ERR("Invalid device start/length");
 
-	r = dm_get_device(ti, argv[0], dev->start, dev->size,
-			  dev->mode, &dev->dev);
-	if (r)
+	r = dm_get_device(ti, argv[0], dev->mode, &dev->dev);
+	if (r) {
 		TI_ERR("Device lookup failed");
+	} else {
+		/* Check cache device limits. */
+		if (dev->size >
+		    to_sector(i_size_read(dev->dev->bdev->bd_inode)))
+			TI_ERR("Device size");
+	}
 
 	return 0;
 }
@@ -1877,19 +1825,19 @@ static int get_dev(struct dm_target *ti, char **argv, struct c_dev *dev)
 /* Check helper: device sizes make sense? */
 static int size_check(struct hstore_c *hc)
 {
-	sector_t cache_len, orig_len;
+	sector_t cache_size, orig_size;
 	struct devs *d = &hc->devs;
 
-	orig_len = d->orig.size - d->orig.start;
-	cache_len = d->cache.size - d->cache.start;
-	if (orig_len < cache_len)
-		DM_ERR("origin device smaller than cache device");
+	orig_size = d->orig.size - d->orig.start;
+	cache_size = atomic_read(&hc->extents.total) * hc->extents.size;
+	if (orig_size < cache_size)
+		DM_ERR("origin device size smaller than total cache data size");
 
 	if (!multiple(d->cache.start, META_SECTORS))
 		DM_ERR("cache offset is not divisable by %llu",
 		       (unsigned long long) META_SECTORS);
 
-	if (extents_total(hc) < EXTENTS_MIN)
+	if (atomic_read(&hc->extents.total) < EXTENTS_MIN)
 		DM_ERR("cache too small for extent size");
 
 	return 0;
@@ -1907,35 +1855,39 @@ static int cache_resize(struct dm_target *ti, sector_t cache_size)
 	struct extent *extent;
 	struct list_head list, *pos = &hc->lists.lru;
 
-	if (!cache_size)
+	if (cache_size < extents_start(hc))
 		return 0;
 
 	/* Calculate absolute number of extents fitting cache device size. */
 	extents = cache_size - extents_start(hc);
 	do_div(extents, extent_size(hc));
 
-	extents_old = extents_total(hc);
 	if (extents < EXTENTS_MIN) {
-		DMERR("cache size too small");
+		DMERR("cache size requested is too small");
 		goto err;
-	} else if (extents < extents_old)
-		grow = 0;
-	else if (extents > extents_old)
-		grow = 1;
-	else {
+	}
+
+	extents_old = atomic_read(&hc->extents.total);
+	if (extents == extents_old) {
 		DMERR("cache size wouldn't change");
 		goto err;
 	}
 
+	grow = !!(extents < extents_old);
+
 	/* Try aquiring new cache device size. */
-	/* FIXME: limit checks bogus in dm_get_device()! */
-	r = dm_get_device(ti, cache->dev->name, cache->start,
-			  cache_size, cache->mode, &dev);
+	r = dm_get_device(ti, cache->dev->name, cache->mode, &dev);
 	if (r) {
-		DM_ERR("device size %llu invalid",
-		       (unsigned long long) cache_size);
-	} else
+		DM_ERR("device invalid");
+	} else {
 		dm_put_device(ti, dev);	/* Release device reference. */
+
+		/* Check cache device limits. */
+		if (cache_size >
+		    to_sector(i_size_read(cache->dev->bdev->bd_inode)))
+			DM_ERR("device size %llu invalid",
+		 	      (unsigned long long) cache_size);
+	}
 
 	/* Grow: try allocating additional extent structures. */
 	if (grow) {
@@ -2006,7 +1958,7 @@ static int cache_resize(struct dm_target *ti, sector_t cache_size)
 	/* Update disk header with new cache size. */
 	hc->disk_header = metadata_alloc(hc);
 	r = header_write(hc);
-	metadata_free(hc, hc->disk_header);
+	metadata_free(hc, (void **) &hc->disk_header);
 	if (r) {
 		DMERR("FATAL: Error writing cache header to %s",
 		      cache->dev->name);
@@ -2073,9 +2025,9 @@ str_listed(const char *str, ...)
 /* Check origin device read/write parameter */
 static int orig_rw(const char *arg)
 {
-	if (str_listed(arg, "ro", "readonly"))
+	if (str_listed(arg, "ro", "readonly", NULL))
 		return READ;
-	else if (str_listed(arg, "default", "rw", "readwrite"))
+	else if (str_listed(arg, "default", "rw", "readwrite", NULL))
 		return WRITE;
 	else
 		return -EINVAL;
@@ -2084,166 +2036,36 @@ static int orig_rw(const char *arg)
 enum write_type { WRITEBACK, WRITETHROUGH };
 static enum write_type cache_write_policy(const char *arg)
 {
-	if (str_listed(arg, "default", "wb", "writeback"))
+	if (str_listed(arg, "default", "wb", "writeback", NULL))
 		return WRITEBACK;
-	else if (str_listed(arg, "wt", "writethrough"))
+	else if (str_listed(arg, "wt", "writethrough", NULL))
 		return WRITETHROUGH;
 	else
 		return -EINVAL;
 }
 
-enum store_type { INVALIDATE, TRANSIENT, PERSISTENT };
+enum store_type { TRANSIENT, PERSISTENT };
 static enum store_type cache_store_policy(const char *arg)
 {
-	if (str_listed(arg, "default", "persistent"))
+	if (str_listed(arg, "default", "persistent", NULL))
 		return PERSISTENT;
-	else if (str_listed(arg, "transient"))
+	else if (str_listed(arg, "transient", NULL))
 		return TRANSIENT;
-	else if (str_listed(arg, "invalidate"))
-		return INVALIDATE;
 	else
 		return -EINVAL;
 }
 
-
-/*
- * Construct a cache mapping:
- *
- * FIXME:
- *   o allow extent recovery in case header's lost.
- *
- * cache_dev_name cache_dev_start
- * #varibale_params <params> orig_dev_name orig_dev_start
- *
- * #variable_params = 0-6
- *
- * params = {auto/create/open} [cache_dev_size [#cache_extent_size \
- *	    [default/rw/readwrite/ro/readonly \
- *	     [default/wb/writeback/wt/writethrough \
- *           [default/persistent/transient/invalidate]]]]]
- *
- * 'auto' causes open of a cache with a valid header or
- * creation of a new cache if there's no vaild one with
- * cache_dev_size in case the header's invalid. If 'auto'
- * is being used on a non-existing cache without cache_dev_size
- * or cache_dev_size = 0, the constructor fails
- *
- * 'create' enforces creation of a new cache with cache_dev_size.
- * WARNING: this overwrites an existing cache!!!
- *
- * 'open' requires a valid cache to exist. No new one will be
- * created ever.
- *
- * #variable_params:
- * 0: the cache device must exist and will be opened or the constructor fails
- * 1 + 'open': equal to '0'
- * 1 + 'auto': equal to '0'
- * 2 + 'open': the cache device must be initialized and resizing will
- *	       get tried to cache_dev_size. cache_dev_size = 0 doesn't
- *	       change the cache size.
- * 2 + 'create': the cache device will get initialized and sized
- *	         to cache_dev_size.
- * 2 + 'auto': the cache device will either be opend and tried to resize
- * 	       or get initialized and sized to cache_dev_size.
- * 3: on create (either implicit or via 'auto'),
- *    this cache:extens_size  will be used.
- * 4: the origin device will be opend read only/read write,
- *    defaulting to read write
- * 5: the cache will be set to writeback or writethrough,
- *    defaulting to writeback
- * 6: the cache will be set to  persistency or transient, defaulting
- *    to persistent *or* a persistent cache will get purged
- */
-#define MIN_PARAMS	5
-#define MAX_PARAMS	(MIN_PARAMS + 6)
-static int hstore_ctr(struct dm_target *ti, unsigned argc, char **argv)
+/* Allocate and initialize a hstore_c context. */
+static int
+context_alloc(struct dm_target *ti, char **argv,
+	      sector_t cache_start, sector_t cache_size, sector_t extent_size,
+	      int hstore_params, int orig_access,
+	      enum handle_type handle,
+	      enum write_type write_policy, enum store_type store_policy)
 {
-	/* Default to writable original device. */
-	int hstore_params, r, orig_access = WRITE;
-	unsigned num_pages = 16; /* 16 pages for metadata IO in parallel. */
-	unsigned long long tmp;
-	sector_t cache_size = 0, cache_start, extents,
-		 extent_size = EXTENT_SECTORS_DEFAULT;
-	/* Defaults: persitent, writeback cache and open. */
-	enum store_type store_policy = PERSISTENT;
-	enum write_type write_policy = WRITEBACK;
-	enum handle_type handle = OPEN_CACHE;
+	int r;
 	struct hstore_c *hc;
-
-	if (!range_ok(argc, MIN_PARAMS, MAX_PARAMS))
-		TI_ERR("Invalid argument count");
-
-	/* Get cache device offset. */
-	if (sscanf(argv[1], "%llu", &tmp) != 1 ||
-	    (tmp && (!is_power_of_2(tmp) || tmp < META_SECTORS)))
-		TI_ERR("Invalid cache device start argument");
-
-	cache_start = tmp;
-
-	/* Get #hstore_params. */
-	if (sscanf(argv[2], "%d", &hstore_params) != 1 ||
-	    !range_ok(hstore_params, 0, 6))
-		TI_ERR("Invalid hstore parameter number argument");
-
-	if (argc - hstore_params - 3 != 2)
-		TI_ERR("Invalid number of original device arguments");
-
-	/* Handle any variable cache parameters. */
-	if (hstore_params) {
-		if (str_listed(argv[3], handle_str(CREATE_CACHE), NULL)) {
-			handle = CREATE_CACHE;
-			if (hstore_params == 1)
-				TI_ERR("hstore create needs another argument");
-		} else if (str_listed(argv[3], handle_str(OPEN_CACHE), NULL)) {
-			handle = OPEN_CACHE;
-			if (hstore_params > 5)
-				TI_ERR("Too many arguments with hstore 'open'");
-		} else if (str_listed(argv[3], handle_str(AUTO_CACHE), NULL))
-			handle = AUTO_CACHE;
-		else
-			TI_ERR("Invalid hstore auto/create/open argument");
-
-		/* Get cache device size. */
-		if (hstore_params > 1) {
-			if (sscanf(argv[4], "%llu", &tmp) != 1 ||
-			    tmp < MIN_CACHE_SIZE)
-				TI_ERR("Invalid cache device size argument");
-
-			cache_size = tmp;
-		}
-
-		/* Get origin rw mode. */
-		if (hstore_params > 2) {
-			orig_access = orig_rw(argv[5]);
-			if (orig_access < 0)
-				TI_ERR("Invalid original rw parameter");
-		}
-
-		/* Get cache extent size. */
-		if (hstore_params > 3) {
-			if (sscanf(argv[6], "%llu", &tmp) != 1 ||
-			    !is_power_of_2(tmp) ||
-			    (tmp && (tmp < META_SECTORS)))
-				TI_ERR("Invalid cache extent size argument")
-
-			extent_size = tmp;
-		}
-
-		/* Get cache write policy. */
-		if (hstore_params > 4) {
-			write_policy = cache_write_policy(argv[7]);
-			if (write_policy < 0)
-				TI_ERR("Invalid cache write policy argument");
-		}
-
-		/* Get cache persistency policy / invalidation request. */
-		if (hstore_params > 5) {
-			store_policy = cache_store_policy(argv[8]);
-			if (store_policy < 0)
-				TI_ERR("Invalid cache persistency/invalidation "
-				       "policy argument");
-		}
-	}
+	unsigned num_pages = 32; /* Pages for metadata IO in parallel. */
 
 	/* Got all constructor information to allocate context. */
 	hc = kzalloc(sizeof(*hc), GFP_KERNEL);
@@ -2259,11 +2081,9 @@ static int hstore_ctr(struct dm_target *ti, unsigned argc, char **argv)
 	hc->params.store_policy = store_policy;
 
 	/* Preset extent size. */
-	hc->extents.size = extent_size ? extent_size :
-					    EXTENT_SECTORS_DEFAULT;
+	hc->extents.size = extent_size ? extent_size : EXTENT_SECTORS_DEFAULT;
 
 	init_waitqueue_head(&hc->io.suspendq);	/* Suspend waiters. */
-	init_waitqueue_head(&hc->io.invalidateq);/* Invalidate waiters. */
 	atomic_set(&hc->io.ref, 0);
 	atomic_set(&hc->extents.free, 0);
 	atomic_set(&hc->extents.initialized, 0);
@@ -2329,31 +2149,21 @@ static int hstore_ctr(struct dm_target *ti, unsigned argc, char **argv)
 	if (r)
 		goto err;
 
-	if (store_policy == INVALIDATE) {
-		DMWARN("Ignoring \"invalidate\" argument");
-		store_policy = PERSISTENT;
-	}
-
 	/* Change cache flags if requested by ctr arguments. */
-	if (store_policy == PERSISTENT)
-		SetCachePersistent(hc);
-	else if (store_policy == TRANSIENT)
-		ClearCachePersistent(hc);
-
-	if (write_policy == WRITEBACK)
-		ClearCacheWriteThrough(hc);
-	else if (write_policy == WRITETHROUGH)
-		SetCacheWriteThrough(hc);
+	store_policy == PERSISTENT ? SetCachePersistent(hc) :
+				     ClearCachePersistent(hc);
+	write_policy == WRITEBACK ? ClearCacheWriteThrough(hc) :
+				    SetCacheWriteThrough(hc);
 
 	hc->disk_header = metadata_alloc(hc);
 	r = header_write(hc);
+	metadata_free(hc, (void **) &hc->disk_header);
 	if (r) {
-		metadata_free(hc, hc->disk_header);
 		ti->error = "Error writing cache device header";
 		goto err;
 	}
 
-	metadata_free(hc, hc->disk_header);
+	atomic_set(&hc->extents.total, extents_total(hc));
 
 	/* Check, if device sizes are valid. */
 	r = size_check(hc);
@@ -2365,8 +2175,12 @@ static int hstore_ctr(struct dm_target *ti, unsigned argc, char **argv)
 	 * in header differs from ctr parameter.
 	 */
 	if (cache_size && cache_size != hc->devs.cache.size) {
+		sector_t cur_size = hc->devs.cache.size;
+
 		dm_put_device(ti, hc->devs.cache.dev);
+		hc->devs.cache.size = cache_size;
 		r = get_dev(ti, argv, &hc->devs.cache);
+		hc->devs.cache.size = cur_size;
 		if (r)
 			goto err;
 
@@ -2375,8 +2189,7 @@ static int hstore_ctr(struct dm_target *ti, unsigned argc, char **argv)
 		SetCacheResize(hc);
 	}
 
-	/* Calculate amount of kcopyd pages needed. */
-	extent_size = hc->extents.size;
+	/* Calculate amount of kcopyd pages needed to copy extents. */
 	do_div(extent_size, to_sector(PAGE_SIZE));
 	num_pages *= extent_size;
 
@@ -2392,32 +2205,181 @@ static int hstore_ctr(struct dm_target *ti, unsigned argc, char **argv)
 		goto err;
 	}
 
-	/* Allocate extent structs and put the on init list. */
-	extents = extents_total(hc);
-	atomic_set(&hc->extents.total, extents);
+	/* Allocate extent structs and put them on init list. */
 	r = cache_extents_alloc(hc, hc->devs.cache.size,
-				extents_start(hc), extents, GFP_KERNEL);
+				extents_start(hc),
+				atomic_read(&hc->extents.total), GFP_KERNEL);
 	if (r)
 		goto err;
 
 	/* No larger bios than the extent size and no boundary crossing. */
 	ti->split_io = hc->extents.size;
 
+	/* Create singlethreaded workqueue for this hstore device. */
+	INIT_WORK(&hc->io.ws, do_hstore);
+	hc->io.wq = create_singlethread_workqueue(DAEMON);
+	if (!hc->io.wq) {
+		DMERR("couldn't create work queue");
+		r  =-ENOMEM;
+		goto err;
+	}
+
 	/* Flag extent initialization needs doing by worker thread. */
 	if (CachePersistent(hc))
 		SetCacheInitializing(hc);
-	else
+	else {
+		ClearCacheInitializing(hc);
 		/* Else do it here. */
 		extents_validate_init(hc, extent_init_pop(hc));
-
-	INIT_WORK(&hc->io.ws, do_hstore);
-	return 0;
+	}
 
 err:
-	hstore_dtr(ti);
+	return r;
+}
 
-	if (r == -ENOMEM)
-		TI_ERR_RET("Out of memory", r);
+/*
+ * Construct a cache mapping:
+ *
+ * FIXME:
+ *   o allow extent recovery in case header's lost.
+ *
+ * cache_dev_name cache_dev_start
+ * #varibale_params <params> orig_dev_name orig_dev_start
+ *
+ * #variable_params = 0-6
+ *
+ * params = {auto/create/open} [cache_dev_size [#cache_extent_size \
+ *	     [default/rw/readwrite/ro/readonly \
+ *	     [default/wb/writeback/wt/writethrough \
+ *           [default/persistent/transient/invalidate]]]]]
+ *
+ * 'auto' causes open of a cache with a valid header or
+ * creation of a new cache if there's no vaild one sized to
+ * cache_dev_size.
+ * If 'auto' is being used on a non-existing cache without cache_dev_size
+ * or cache_dev_size = 0, the constructor fails.
+ *
+ * 'create' enforces creation of a new cache with cache_dev_size.
+ * WARNING: this overwrites an existing cache!!!
+ *
+ * 'open' requires a valid cache to exist. No new one will be
+ * created ever.
+ *
+ * #variable_params:
+ * 0: the cache device must exist and will be opened or the constructor fails
+ * 1 + 'open': equal to '0'
+ * 1 + 'auto': equal to '0'
+ * 2 + 'open': the cache device must be initialized and resizing will
+ *	       get tried to cache_dev_size. cache_dev_size = 0 doesn't
+ *	       change the cache size.
+ * 2 + 'create': the cache device will get initialized and sized
+ *	         to cache_dev_size.
+ * 2 + 'auto': the cache device will either be opened and tried to resize
+ * 	       or get initialized and sized to cache_dev_size.
+ * 3: on create (either implicit or via 'auto'),
+ *    this cache_extens_size will be used.
+ * 4: the origin device will be opened read only/read write,
+ *    defaulting to read write
+ * 5: the cache will be set to writeback or writethrough,
+ *    defaulting to writeback
+ * 6: the cache will be set to  persistency or transient, defaulting
+ *    to persistent *or* a persistent cache will get purged
+ */
+#define MIN_PARAMS	5
+#define MAX_PARAMS	(MIN_PARAMS + 6)
+static int hstore_ctr(struct dm_target *ti, unsigned argc, char **argv)
+{
+	/* Default to writable original device. */
+	int hstore_params, r, orig_access = WRITE;
+	unsigned long long tmp;
+	sector_t cache_size = 0, cache_start,
+		 extent_size = EXTENT_SECTORS_DEFAULT;
+	/* Defaults: persitent, writeback cache and open. */
+	enum store_type store_policy = PERSISTENT;
+	enum write_type write_policy = WRITEBACK;
+	enum handle_type handle = OPEN_CACHE;
+
+	if (!range_ok(argc, MIN_PARAMS, MAX_PARAMS))
+		TI_ERR("Invalid argument count");
+
+	/* Get cache device offset. */
+	if (sscanf(argv[1], "%llu", &tmp) != 1 ||
+	    (tmp && (!is_power_of_2(tmp) || tmp < META_SECTORS)))
+		TI_ERR("Invalid cache device start argument");
+
+	cache_start = tmp;
+
+	/* Get #hstore_params. */
+	if (sscanf(argv[2], "%d", &hstore_params) != 1 ||
+	    !range_ok(hstore_params, 0, 6))
+		TI_ERR("Invalid hstore parameter number argument");
+
+	if (argc - hstore_params - 3 != 2)
+		TI_ERR("Invalid number of original device arguments");
+
+	/* Handle any variable cache parameters. */
+	if (hstore_params) {
+		if (str_listed(argv[3], handle_str(CREATE_CACHE), NULL)) {
+			handle = CREATE_CACHE;
+			if (hstore_params == 1)
+				TI_ERR("hstore create needs another argument");
+		} else if (str_listed(argv[3], handle_str(OPEN_CACHE), NULL)) {
+			handle = OPEN_CACHE;
+			if (hstore_params > 5)
+				TI_ERR("Too many arguments with hstore 'open'");
+		} else if (str_listed(argv[3], handle_str(AUTO_CACHE), NULL))
+			handle = AUTO_CACHE;
+		else
+			TI_ERR("Invalid hstore auto/create/open argument");
+
+		/* Get cache device size. */
+		if (hstore_params > 1) {
+			if (sscanf(argv[4], "%llu", &tmp) != 1 ||
+			    tmp < MIN_CACHE_SIZE)
+				TI_ERR("Invalid cache device size argument");
+
+			cache_size = tmp;
+		}
+
+		/* Get cache extent size. */
+		if (hstore_params > 2) {
+			if (sscanf(argv[5], "%llu", &tmp) != 1 ||
+			    !is_power_of_2(tmp) ||
+			    (tmp && (tmp < META_SECTORS)))
+				TI_ERR("Invalid cache extent size argument")
+
+			extent_size = tmp;
+		}
+
+		/* Get origin rw mode. */
+		if (hstore_params > 3) {
+			orig_access = orig_rw(argv[6]);
+			if (orig_access < 0)
+				TI_ERR("Invalid original rw parameter");
+		}
+
+		/* Get cache write policy. */
+		if (hstore_params > 4) {
+			write_policy = cache_write_policy(argv[7]);
+			if (write_policy < 0)
+				TI_ERR("Invalid cache write policy argument");
+		}
+
+		/* Get cache persistency policy / invalidation request. */
+		if (hstore_params > 5) {
+			store_policy = cache_store_policy(argv[8]);
+			if (store_policy < 0)
+				TI_ERR("Invalid cache persistency/invalidation "
+				       "policy argument");
+		}
+	}
+
+	/* Got all parameters -> allocate hstore context. */
+	r = context_alloc(ti, argv, cache_start, cache_size, extent_size,
+			  hstore_params, orig_access,
+			  handle, write_policy, store_policy);
+	if (r)
+		hstore_dtr(ti);
 
 	return r;
 }
@@ -2433,6 +2395,7 @@ static inline void queue_bio(struct hstore_c *hc, struct bio *bio)
 	atomic_inc(hc->stats.io + (bio_data_dir(bio) == WRITE));
 
 	/* Wakeup worker to deal with bio input list. */
+	SetCacheNewBiosQueued(hc);
 	wake_do_hstore(hc);
 }
 
@@ -2465,6 +2428,7 @@ static int hstore_map(struct dm_target *ti, struct bio *bio,
 static int hstore_end_io(struct dm_target *ti, struct bio *bio,
 			 int error, union map_info *map_context)
 {
+	int r = 0;
 	struct extent *extent = map_context->ptr;
 
 	if (extent) {
@@ -2473,35 +2437,35 @@ static int hstore_end_io(struct dm_target *ti, struct bio *bio,
 			SetExtentError(extent);
 
 		/*
-		 * I want another shot on this extents bios in order to
-		 * make sure, that the metadata got updated in case of
+		 * I want another shot on this extents write bios in order
+		 * to make sure, that the metadata got updated in case of
 		 * writes before I report endios up.
 		 *
 		 * In case of read bios only, where no metadata
-		 * update happens, I optimize this out.
+		 * update happens, I can avoid this.
 		 */
-		if (ExtentBioWrite(extent)) {
+		if (bio_data_dir(bio) == WRITE) {
 			unsigned long flags;
 
-			/* Make sure, we don't loop infinitely. */
+			/* Avoid end io looping on writes forever. */
 			map_context->ptr = NULL;
 
 			/*
-			 * Need a spinlock here, because endios
-			 * can be processed in parallel.
+			 * Need a spinlock here, because endios can
+			 * be processed in parallel with my worker.
 			 */
 			spin_lock_irqsave(&extent->io.endio_lock, flags);
 			bio_list_add(&extent->io.endio, bio);
 			spin_unlock_irqrestore(&extent->io.endio_lock, flags);
 
-			endio_put(extent);
-			return DM_ENDIO_INCOMPLETE;	/* Another shot. */
-		} else
-			/* For reads, just drop the reference. */
-			endio_put(extent);
+			r = DM_ENDIO_INCOMPLETE;	/* Another shot. */
+		}
+
+		/* Drop the reference. */
+		endio_put(extent);
 	}
 
-	return 0;
+	return r;
 }
 
 /* Flush method. */
@@ -2509,7 +2473,7 @@ static void hstore_flush(struct dm_target *ti)
 {
 	struct hstore_c *hc = ti->private;
 
-	flush_workqueue(_hstore_wq);
+	flush_workqueue(hc->io.wq);
 
 	/* Wait until all io has been processed. */
 	wait_event(hc->io.suspendq, cc_idle(hc));
@@ -2532,14 +2496,14 @@ static void hstore_resume(struct dm_target *ti)
 	ClearCacheSuspend(hc);
 
 	/*
-	 * Wakeup worker to kick off IO processing in case
-	 * of any left behind extents at device suspension.
+	 * Wakeup worker to:
+	 *
+	 * o kick off IO processing in case of any left behind extents
+	 *   at device suspension.
+	 *
+	 * o initialize backing store after ctr
 	 */
-/* FIXME: let worker always run?
-	if (!list_empty(&hc->lists.dirty) ||
-	    !list_empty(&hc->lists.init) || !list_empty(&hc->lists.flush))
-*/
-		wake_do_hstore(hc);
+	wake_do_hstore(hc);
 }
 
 /* Message handler for origin readonly <-> readwrite transitions. */
@@ -2564,6 +2528,7 @@ static int msg_access(struct hstore_c *hc, char *arg)
 
 	/* Flag worker thread has to adjust access mode. */
 	SetCacheChangeRW(hc);
+	SetCacheChange(hc);
 
 	/*
 	 * Wakeup worker to change access and kick off any dirty
@@ -2572,22 +2537,6 @@ static int msg_access(struct hstore_c *hc, char *arg)
 	 */
 	wake_do_hstore(hc);
 	return 0;
-}
-
-/* Invalidate cache. Cache needs to be quiesced (ie. suspended). */
-static void cache_invalidate(struct hstore_c *hc)
-{
-	sector_t increment = extent_size(hc), offset = extents_start(hc);
-	struct extent *extent;
-
-	list_for_each_entry(extent, &hc->lists.lru, lists.init_lru) {
-		if (!ExtentFree(extent))
-			atomic_inc(&hc->extents.free);
-
-		extent_hash_del(extent);
-		extent_init(hc, extent, offset);
-		offset += increment;
-	}
 }
 
 /* Message handler to change cache persistency setting or invalidate cache. */
@@ -2608,21 +2557,13 @@ static int msg_cache(struct hstore_c *hc, char *arg)
 	} else if (r == TRANSIENT) {
 		if (!CachePersistent(hc))
 			return -EPERM;
-	} else if (r == INVALIDATE) {
-		SetCacheInvalidate(hc);
-		wait_event(hc->io.invalidateq, cc_cache_clean(hc));
-		cache_invalidate(hc);
-
-		if (CachePersistent(hc))
-			write_free_header(hc);
-
-		ClearCacheInvalidate(hc);
-		goto out;
 	} else
 		DM_ERR("invalid cache persistency argument.");
 
+	/* Flag worker thread has to adjust cache persistency mode. */
+	SetCacheChangePersistency(hc);
+	SetCacheChange(hc);
 	wake_do_hstore(hc);
-out:
 	return 0;
 }
 
@@ -2641,6 +2582,8 @@ static int msg_resize(struct hstore_c *hc, char *arg)
 		return -EINVAL;
 
 	hc->params.cache_new_size = tmp;
+
+	/* Flag worker thread has to resize the cache. */
 	SetCacheResize(hc);
 	wake_do_hstore(hc);
 	return 0;
@@ -2662,6 +2605,7 @@ static int msg_write_policy(struct hstore_c *hc, char *arg)
 
 	/* Flag worker thread: has to change cache write policy. */
 	SetCacheChangeWritePolicy(hc);
+	SetCacheChange(hc);
 	wake_do_hstore(hc);
 	return 0;
 }
@@ -2670,7 +2614,7 @@ static int msg_write_policy(struct hstore_c *hc, char *arg)
 static int hstore_message(struct dm_target *ti, unsigned argc, char **argv)
 {
 	if (argc == 1) {
-		if (str_listed(argv[0], "flush")) {
+		if (str_listed(argv[0], "flush", NULL)) {
 			struct hstore_c *hc = ti->private;
 
 			if (!CacheSuspend(hc)) {
@@ -2680,13 +2624,13 @@ static int hstore_message(struct dm_target *ti, unsigned argc, char **argv)
 				DM_ERR_RET(-EPERM, "Cache suspended");
 		}
 	} else if (argc == 2) {
-		if (str_listed(argv[0], "access"))
+		if (str_listed(argv[0], "access", NULL))
 			return msg_access(ti->private, argv[1]);
-		else if (str_listed(argv[0], "cache"))
+		else if (str_listed(argv[0], "cache", NULL))
 			return msg_cache(ti->private, argv[1]);
-		else if (str_listed(argv[0], "resize"))
+		else if (str_listed(argv[0], "resize", NULL))
 			return msg_resize(ti->private, argv[1]);
-		else if (str_listed(argv[0], "write_policy"))
+		else if (str_listed(argv[0], "write_policy", NULL))
 			return msg_write_policy(ti->private, argv[1]);
 	}
 
@@ -2698,7 +2642,7 @@ static int hstore_message(struct dm_target *ti, unsigned argc, char **argv)
 static int hstore_status(struct dm_target *ti, status_type_t type,
 			 char *result, unsigned maxlen)
 {
-	unsigned dirty, extent_valid, handle, hits;
+	unsigned dirty, handle, hits;
 	ssize_t sz = 0;
 	struct hstore_c *hc = ti->private;
 	struct stats *s;
@@ -2706,13 +2650,12 @@ static int hstore_status(struct dm_target *ti, status_type_t type,
 	switch (type) {
 	case STATUSTYPE_INFO:
 		s = &hc->stats;
-		extent_valid = atomic_read(&s->extent_valid);
-		dirty = atomic_read(&s->extent_dirty),
-		    hits = atomic_read(&s->hits);
+		dirty = atomic_read(&s->extent_dirty);
+		hits = atomic_read(&s->hits);
 		DMEMIT
 		    ("v=%s %s %s %s %s %s es=%llu flgs=%lu bkts=%u r=%u w=%u "
 		     "rd=%u wd=%u rs=%u ws=%u ca=%u dr=%u dw=%u mr=%u mw=%u "
-		     "ev=%u einv=%u ed=%u ec=%u h=%u m=%u ov=%u wf=%u wrf=%u "
+		     "ed=%u ec=%u h=%u m=%u ov=%u wf=%u wrf=%u "
 		     "ef=%u ei=%u et=%u", version,
 		     OrigWritable(hc) ? "rw" : "ro",
 		     CacheInitializing(hc) ? "INIT" : "ready",
@@ -2730,8 +2673,8 @@ static int hstore_status(struct dm_target *ti, status_type_t type,
 		     atomic_read(s->extent_data_io),
 		     atomic_read(s->extent_data_io + 1),
 		     atomic_read(s->extent_meta_io),
-		     atomic_read(s->extent_meta_io + 1), extent_valid,
-		     hits - extent_valid, dirty,
+		     atomic_read(s->extent_meta_io + 1),
+		     dirty,
 		     atomic_read(&s->extent_clear_uptodate),
 		     atomic_read(&s->hits), atomic_read(&s->misses),
 		     atomic_read(&s->overwrite),
@@ -2776,7 +2719,7 @@ static void hstore_io_hints(struct dm_target *ti, struct queue_limits *limits)
 {
 	struct hstore_c *hc = ti->private;
 
-	blk_limits_io_min(limits, hc->extents.size);
+	blk_limits_io_min(limits, 0);
 	blk_limits_io_opt(limits, hc->extents.size);
 }
 
@@ -2799,20 +2742,11 @@ static struct target_type hstore_target = {
 
 int __init dm_hstore_init(void)
 {
-	int r;
+	int r = dm_register_target(&hstore_target);
 
-	/* Create global multithreaded workqueue for all hstore devices. */
-	_hstore_wq = create_workqueue(DAEMON);
-	if (!_hstore_wq)
-		DM_ERR_RET(-ENOMEM, "failed to create workqueue");
-
-	r = dm_register_target(&hstore_target);
-	if (r) {
-		destroy_workqueue(_hstore_wq);
+	if (r)
 		DMERR("Failed to register %s [%d]", DM_MSG_PREFIX, r);
-	}
-
-	if (!r)
+	else
 		DMINFO("registered %s %s", DM_MSG_PREFIX, version);
 
 	return r;
@@ -2821,7 +2755,6 @@ int __init dm_hstore_init(void)
 void dm_hstore_exit(void)
 {
 	dm_unregister_target(&hstore_target);
-	destroy_workqueue(_hstore_wq);
 	DMINFO("unregistered %s %s", DM_MSG_PREFIX, version);
 }
 
