@@ -41,7 +41,7 @@
  *
  */
 
-static const char version[] = "0.156";
+static const char version[] = "0.160";
 
 #include "dm.h"
 
@@ -114,8 +114,7 @@ struct extent {
 	struct {
 		struct list_head hash;		/* Hash */
 		struct list_head endio;		/* Endio. */
-		struct list_head dirty;		/* Dirty */
-		struct list_head flush;		/* Flush. */
+		struct list_head dirty_flush;	/* Dirty/flush. */
 		struct list_head init_lru;	/* Extent to init or reusable */
 		atomic_t endio_ref;	/* Used to put extent on endio list. */
 	} lists;
@@ -363,7 +362,6 @@ enum hstore_c_flags {
 	CACHE_CHANGE_PERSISTENCY,	/* Toggle cache persistency. */
 	CACHE_CHANGE_RW,		/* Toggle origin rw access. */
 	CACHE_CHANGE_WRITE_POLICY,	/* Toggle cache write policy. */
-	CACHE_DIRTY_FLUSHING,		/* Cache is flushing dirty extents. */
 	CACHE_INITIALIZING,		/* Cache initialization of extents. */
 	CACHE_INITIALIZING_NEW,		/* Write " */
 	CACHE_INITIALIZATION_ACTIVE,	/* Initialization IO active. */
@@ -383,7 +381,6 @@ BITOPS(Cache, Change, hstore_c, CACHE_CHANGE)
 BITOPS(Cache, ChangePersistency, hstore_c, CACHE_CHANGE_PERSISTENCY)
 BITOPS(Cache, ChangeRW, hstore_c, CACHE_CHANGE_RW)
 BITOPS(Cache, ChangeWritePolicy, hstore_c, CACHE_CHANGE_WRITE_POLICY)
-BITOPS(Cache, DirtyFlushing, hstore_c, CACHE_DIRTY_FLUSHING)
 BITOPS(Cache, Initializing, hstore_c, CACHE_INITIALIZING)
 BITOPS(Cache, InitializingNew, hstore_c, CACHE_INITIALIZING_NEW)
 BITOPS(Cache, InitializationActive, hstore_c, CACHE_INITIALIZATION_ACTIVE)
@@ -454,8 +451,7 @@ static void *extent_alloc(struct hstore_c *hc, gfp_t flags)
 		bio_list_init(&extent->io.defer);
 		INIT_LIST_HEAD(&extent->lists.hash);
 		INIT_LIST_HEAD(&extent->lists.endio);
-		INIT_LIST_HEAD(&extent->lists.dirty);
-		INIT_LIST_HEAD(&extent->lists.flush);
+		INIT_LIST_HEAD(&extent->lists.dirty_flush);
 		INIT_LIST_HEAD(&extent->lists.init_lru);
 		atomic_set(&extent->lists.endio_ref, 0);
 	}
@@ -499,11 +495,6 @@ static int multiple(sector_t a, sector_t b)
 static int cc_ios_inflight(struct hstore_c *hc)
 {
 	return atomic_read(&hc->io.ref);
-/* xXx
- ||
-	       !list_empty(&hc->lists.endio) ||
-	       !list_empty(&hc->lists.flush);
-*/
 }
 
 /* Check cache idle. */
@@ -715,20 +706,32 @@ static struct extent *extent_endio_pop(struct hstore_c *hc)
 	return extent;
 }
 
-/* Pop an extent off the flush list. */
-static struct extent *extent_flush_pop(struct hstore_c *hc)
+/* Pop an extent off the dirty/flush list. */
+static struct extent *_extent_pop(struct list_head *list)
 {
 	struct extent *extent;
 
-	if (list_empty(&hc->lists.flush))
+	if (list_empty(list))
 		extent = NULL;
 	else {
-		extent = list_first_entry(&hc->lists.flush,
-					  struct extent, lists.flush);
-		list_del_init(&extent->lists.flush);
+		extent = list_first_entry(list, 
+					  struct extent, lists.dirty_flush);
+		list_del_init(&extent->lists.dirty_flush);
 	}
 
 	return extent;
+}
+
+/* Pop an extent off the flush list. */
+static struct extent *extent_dirty_pop(struct hstore_c *hc)
+{
+	return _extent_pop(&hc->lists.dirty);
+}
+
+/* Pop an extent off the flush list. */
+static struct extent *extent_flush_pop(struct hstore_c *hc)
+{
+	return _extent_pop(&hc->lists.flush);
 }
 
 /* Pop an extent off the init list. */
@@ -918,7 +921,7 @@ static inline void extent_dirty_add(struct extent *extent)
 {
 	/* REMOVEME: statistics */
 	atomic_inc(&extent->hc->stats.extent_dirty);
-	_extent_add(&extent->lists.dirty, &extent->hc->lists.dirty);
+	_extent_add(&extent->lists.dirty_flush, &extent->hc->lists.dirty);
 }
 
 /* Add extent to end of LRU list. */
@@ -965,7 +968,7 @@ struct extent *extent_lru_pop(struct hstore_c *hc)
 /* Add extent to end of flush list. */
 static void extent_flush_add(struct extent *extent)
 {
-	_extent_add(&extent->lists.flush, &extent->hc->lists.flush);
+	_extent_add(&extent->lists.dirty_flush, &extent->hc->lists.flush);
 }
 
 /* Safely delete an extent from the hash. */
@@ -1216,19 +1219,19 @@ static int extent_data_io(struct hstore_c *hc, struct extent *extent, int rw)
 			      kcopy_endio, extent);
 }
 
-/* Defer a bio to the extent for later processing. */
+/* Defer a bio to the gotten extent for later processing. */
 static void _bio_defer_to_extent(struct extent *extent, struct bio *bio)
 {
 	bio_list_add(&extent->io.defer, bio);
 }
 
-/* Defer a bio to the hstore_c for later processing. */
+/* Defer a bio to the hstore_c in case of no extent for later processing. */
 static void _bio_defer_to_hc(struct hstore_c *hc, struct bio *bio)
 {
 	bio_list_add(&hc->io.defer, bio);
 }
 
-/* Defer bio list and bio when no extents available and update statistics. */
+/* Defer bio list and bio for later processing and update statistics. */
 static void _bio_list_defer(struct hstore_c *hc, struct bio_list *ios,
 			    struct bio *bio)
 {
@@ -1499,7 +1502,6 @@ static void do_endios(struct hstore_c *hc)
 			 * while initializing the cache, so we'll
 			 * validate the metadata and carry on.
 			 */
-// xXx
 			if (TestClearExtentInitializing(extent)) {
 				ClearCacheInitializationActive(hc);
 				extent_validate(extent);
@@ -1519,7 +1521,6 @@ static void do_endios(struct hstore_c *hc)
 			} else if (TestClearExtentDirty(extent)) {
 				/* Extent written to origin. */
 				BUG_ON(!ExtentUptodate(extent));
-				ClearCacheDirtyFlushing(hc);
 
 				/* REMOVEME: statistics. */
 				atomic_dec(&hc->stats.extent_dirty);
@@ -1538,10 +1539,9 @@ static void do_endios(struct hstore_c *hc)
 		if (bio_list_empty(&extent->io.in)) {
 			if (ExtentDirty(extent)) {
 				/* If dirty, move to front of dirty list. */
-				_extent_del(&extent->lists.dirty);
-				list_add(&extent->lists.dirty,
+				_extent_del(&extent->lists.dirty_flush);
+				list_add(&extent->lists.dirty_flush,
 					 &hc->lists.dirty);
-				ClearCacheDirtyFlushing(hc);
 			} else
 				/* No bios and not dirty -> put on LRU list. */
 				extent_lru_add(extent);
@@ -1573,8 +1573,7 @@ static void do_extents_init(struct hstore_c *hc)
 		} else
 			SetExtentMetaRead(extent);
 
-		/* Flag it to be sitinguishable in do_endios(). */
-// xXx
+		/* Flag it to be distinguishable in do_endios(). */
 		SetExtentInitializing(extent);
 		SetCacheInitializationActive(hc);
 
@@ -1616,10 +1615,10 @@ static void _bio_restore_and_error(struct bio *bio)
  * Handle all incoming/deferred bios.
  *
  * The following extent states are handled here:
- *   o can't get extent from hash or LRU -> put bio off.
+ *   o can't get extent from hash or LRU -> put bio off for later processing.
  *   o else merge bio into the bio queue of the extent and put extent
- *     onto flush list unless extent is active (do_endios() will
- *     put those on flush list).
+ *     onto flush list unless extent is active and not uptodate or
+ *     it's a write (do_endios() will put those on flush list).
  */
 static void do_bios(struct hstore_c *hc)
 {
@@ -1633,7 +1632,7 @@ static void do_bios(struct hstore_c *hc)
 	    bio_list_empty(&hc->io.defer))
 		return;
 
-	/* When invalidating the cache or handling a barrier -> wait. */
+	/* When handling a barrier -> wait untill all inflight ios finish. */
 	if (CacheBarrier(hc) && cc_ios_inflight(hc))
 		return;
 
@@ -1691,8 +1690,8 @@ static void do_bios(struct hstore_c *hc)
 				/* REMOVEME: statistics. */
 				atomic_inc(&hc->stats.extent_copy_active);
 	
-				if (bio_data_dir(bio) == WRITE ||
-				    !ExtentUptodate(extent)) {
+				/* Allow all io on uptodate extents. */
+				if (!ExtentUptodate(extent)) {
 					_bio_defer_to_extent(extent, bio);
 					continue;
 				}
@@ -1726,7 +1725,7 @@ static void do_overwrite_check(struct hstore_c *hc)
 {
 	struct extent *extent;
 
-	list_for_each_entry(extent, &hc->lists.flush, lists.flush) {
+	list_for_each_entry(extent, &hc->lists.flush, lists.dirty_flush) {
 		/* Skip any uptodate or being copied extents. */
 		if (!ExtentUptodate(extent) &&
 		    !ExtentCopyActive(extent)) {
@@ -1757,32 +1756,16 @@ static void do_dirty(struct hstore_c *hc)
 	 * Only put any dirty extent on flush list in case:
 	 *   o we're not asked to suspend
 	 *   o the original device is writable
-	 *   o we're not flushing out dirty extents right now
-	 *   o we're idle (ie. no bios pending)
 	 *   -or-
 	 *   o the LRU list is empty
 	 */
-	if ((!CacheSuspend(hc) &&
-	     OrigWritable(hc) &&
-	     !CacheDirtyFlushing(hc)) ||
+	if ((!CacheSuspend(hc) && OrigWritable(hc)) ||
 	    list_empty(&hc->lists.lru)) {
-		struct extent *extent, *tmp;
+		struct extent *extent;
 
-		list_for_each_entry_safe(extent, tmp, &hc->lists.dirty,
-					 lists.dirty) {
+		while ((extent = extent_dirty_pop(hc))) {
 			BUG_ON(ExtentCopyActive(extent));
-
-			/* Don't initiate IO on extent with active bios. */
-			if (ExtentBioActive(extent))
-				continue;
-
-			/* Flag that we're flushing a dirty extent. */
-			SetCacheDirtyFlushing(hc);
-
-			/* Take extent off dirty list and add to flush list. */
-			list_del_init(&extent->lists.dirty);
 			extent_flush_add(extent);
-			break;
 		}
 	}
 }
@@ -1802,7 +1785,6 @@ static void do_flush(struct hstore_c *hc)
 	/* Work all extents on flush list. */
 	while ((extent = extent_flush_pop(hc))) {
 		/* Take off endio list if on. */
-// xXx
 		spin_lock_irq(&hc->lists.locks.endio);
 		_extent_del(&extent->lists.endio);
 		spin_unlock_irq(&hc->lists.locks.endio);
@@ -2295,7 +2277,7 @@ err:
  * params = {auto/create/open} [cache_dev_size [#cache_extent_size \
  *	     [default/rw/readwrite/ro/readonly \
  *	     [default/wb/writeback/wt/writethrough \
- *           [default/persistent/transient/invalidate]]]]]
+ *           [default/persistent/transient]]]]]
  *
  * 'auto' causes open of a cache with a valid header or
  * creation of a new cache if there's no vaild one sized to
@@ -2586,7 +2568,7 @@ static int msg_access(struct hstore_c *hc, char *arg)
 	return 0;
 }
 
-/* Message handler to change cache persistency setting or invalidate cache. */
+/* Message handler to change cache persistency setting. */
 static int msg_cache(struct hstore_c *hc, char *arg)
 {
 	int r = cache_store_policy(arg);
