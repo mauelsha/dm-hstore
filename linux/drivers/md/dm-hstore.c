@@ -41,7 +41,7 @@
  *
  */
 
-static const char version[] = "0.185";
+static const char version[] = "0.187";
 
 #include "dm.h"
 
@@ -642,14 +642,15 @@ static int endio_ref(struct extent *extent)
 static int endio_get(struct extent *extent)
 {
 	int r = 0;
+	struct hstore_c *hc = extent->hc;
 
-	atomic_inc(&extent->hc->io.ref);
+	atomic_inc(&hc->io.ref);
 
 	if (!atomic_inc_return(&extent->lists.endio_ref)) {
 		/* Take off endio list if on. */
-		spin_lock_irq(&extent->hc->lists.lock_endio);
+		spin_lock_irq(&hc->lists.lock_endio);
 		r = _extent_del_safe(&extent->lists.endio);
-		spin_unlock_irq(&extent->hc->lists.lock_endio);
+		spin_unlock_irq(&hc->lists.lock_endio);
 
 	}
 
@@ -923,27 +924,31 @@ static int header_check(struct hstore_c *hc)
 	return (r && !hm) ? -EPERM : r;
 }
 
+static struct bio *_bio_list_pop_safe(struct extent *extent,
+				      struct bio_list *endio_list)
+{
+	struct bio *bio;
+
+	spin_lock_irq(&extent->io.endio_lock);
+	bio = bio_list_pop(endio_list);
+	spin_unlock_irq(&extent->io.endio_lock);
+
+	return bio;
+}
+
 /*
  * bio_endio() an extents endio write bio_list
  * stopping in case metadata ain't written yet.
  */
 static void extent_endio_bio_list(struct extent *extent)
 {
-	struct bio_list *endio_list = &extent->io.endio;
-
-	if (!bio_list_empty(endio_list)) {
-		int error = ExtentError(extent) ? -EIO : 0,
-		    stop_writes = ExtentMetaIo(extent);
+	if (!ExtentMetaIo(extent)) {
+		struct bio_list *endio_list = &extent->io.endio;
+		int error = ExtentError(extent) ? -EIO : 0;
 		struct bio *bio;
-	
-		while ((bio = bio_list_pop(endio_list))) {
-			if (stop_writes) {
-				bio_list_add_head(endio_list, bio);
-				break;
-			}
-	
+
+		while ((bio = _bio_list_pop_safe(extent, endio_list)))
 			bio_endio(bio, error);
-		}
 	}
 }
 
@@ -960,12 +965,6 @@ static inline void extent_dirty_add(struct extent *extent)
 
 	_extent_del_safe(&extent->lists.dirty_flush);
 	_extent_add_safe(&extent->lists.dirty_flush, &hc->lists.dirty);
-	atomic_inc(&hc->stats.extent_dirty); /* REMOVEME: statistics */
-}
-
-static inline void extent_dirty_del(struct extent *extent)
-{
-	_extent_del_safe(&extent->lists.dirty_flush);
 }
 
 /* Add extent to end of LRU list. */
@@ -1405,12 +1404,13 @@ static void bios_io(struct hstore_c *hc, struct extent *extent)
 			if (!TestClearExtentUptodate(extent))
 				/* Write metadata only on first change. */
 				meta_io = 0;
-		} else
+		} else if (!TestSetExtentDirty(extent))
 			/*
 			 * FIXME: we don't need to write metadata, if
 			 * we already did with the proper states!
 			 */
-			SetExtentDirty(extent);
+			/* REMOVEME: statistics */
+			atomic_inc(&hc->stats.extent_dirty); 
 
 		/* Update metadata of this extent on cache device. */
 		if (CachePersistent(hc) && !ExtentMetaIo(extent) && meta_io) {
@@ -1578,9 +1578,8 @@ static void do_endios(struct hstore_c *hc)
 				 */
 				BUG_ON(!ExtentUptodate(extent));
 				atomic_dec(&hc->extents.dirty_flushing);
-	
 				/* REMOVEME: statistics. */
-				atomic_dec(&hc->stats.extent_dirty);
+				atomic_dec(&hc->stats.extent_dirty); 
 			}
 		}
 
@@ -1733,7 +1732,6 @@ static void do_bios(struct hstore_c *hc)
 
 			/* Put bio on extents input queue and on flush list, */
 			bio_list_add(&extent->io.in, bio);
-			extent_dirty_del(extent);
 			extent_flush_add(extent);
 		} else {
 			/* REMOVEME: statistics */
@@ -1816,7 +1814,6 @@ static void do_dirty(struct hstore_c *hc)
 			BUG_ON(ExtentMetaIo(extent));
 			BUG_ON(ExtentDataIo(extent));
 			BUG_ON(ExtentCopyActive(extent));
-			extent_dirty_del(extent);
 			extent_flush_add(extent);
 			atomic_inc(&hc->extents.dirty_flushing);
 		}
@@ -2522,12 +2519,14 @@ static int hstore_end_io(struct dm_target *ti, struct bio *bio,
 			SetExtentError(extent);
 
 		/*
-		 * I want another shot on this extents write bios in order
-		 * to make sure, that the metadata got updated in case of
-		 * writes before I report endios up.
+		 * If metadata is still being written, I want another shot
+		 * on this extents write bios in order to make sure, that
+		 * the metadata got updated in case of writes before I report
+		 * endios up.
 		 *
-		 * In case of read bios only, where no metadata
-		 * update happens, I can avoid this.
+		 * In case of read bios only, where no metadata update
+		 * happens because the extent is already uptodate,
+		 * I can avoid this.
 		 */
 		if (bio_data_dir(bio) == WRITE &&
 		    ExtentMetaIo(extent)) {
