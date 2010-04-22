@@ -41,7 +41,7 @@
  *
  */
 
-static const char version[] = "0.194";
+static const char version[] = "0.198";
 
 #include "dm.h"
 
@@ -85,7 +85,7 @@ static const char version[] = "0.194";
 static unsigned parallel_io_min = 32;
 
 /* Maximum parallel dirty extents flushing in order to minimize contention. */
-static unsigned parallel_dirty_max = 3;
+static unsigned parallel_dirty_min = 3;
 
 /* Maximum parallel extent creation in order to avoid starvation on writes. */
 static unsigned parallel_init_max = 2048;
@@ -176,7 +176,7 @@ struct disk_header {
 	uint64_t flags;		/* Feature flags. */
 } __attribute__ ((__packed__));
 
-/* Macros to access state flags. */
+/* Macros to access object state flags. */
 #define	BITOPS(name, what, var, flag) \
 static inline int TestClear ## name ## what(struct var *v) \
 { return test_and_clear_bit(flag, &v->io.flags); } \
@@ -204,6 +204,7 @@ enum extent_flags {
 	EXTENT_INITIALIZING,	/* Extent initializing. */
 	EXTENT_META_READ,	/* Extent metadata read. */
 	EXTENT_COPYING,		/* Extent copy to/from origin in progress. */
+	EXTENT_COPY_IO,		/* Extent data copy io active. */
 	EXTENT_META_IO,		/* Extent metadata io active. */
 };
 
@@ -215,6 +216,7 @@ BITOPS(Extent, Free, extent, EXTENT_FREE)
 BITOPS(Extent, Initializing, extent, EXTENT_INITIALIZING)
 BITOPS(Extent, MetaRead, extent, EXTENT_META_READ)
 BITOPS(Extent, Copying, extent, EXTENT_COPYING)
+BITOPS(Extent, CopyIo, extent, EXTENT_COPY_IO)
 BITOPS(Extent, MetaIo, extent, EXTENT_META_IO)
 
 /* REMOVEME: */
@@ -806,6 +808,7 @@ static void meta_endio(unsigned long error, void *context)
 /* Endio function for extent_data_io(); kcopyd used. */
 static void kcopy_endio(int read_err, unsigned long write_err, void *context)
 {
+	BUG_ON(!TestClearExtentCopyIo((struct extent*) context));
 	endio((unsigned long) (read_err || write_err), context);
 }
 
@@ -1100,6 +1103,7 @@ static struct extent *extent_get(struct hstore_c *hc, struct bio *bio)
 	if (extent) {
 		BUG_ON(!bio_list_empty(&extent->io.in));
 		BUG_ON(!bio_list_empty(&extent->io.endio));
+		BUG_ON(ExtentCopyIo(extent));
 		BUG_ON(ExtentMetaIo(extent));
 		BUG_ON(ExtentCopying(extent));
 
@@ -1356,6 +1360,7 @@ static void extent_io(int rw, struct extent *extent)
 	}
 
 	BUG_ON(TestSetExtentCopying(extent));
+	BUG_ON(TestSetExtentCopyIo(extent));
 
 	/* Take out a references for the extent data IOs. */
 	endio_get(extent);
@@ -1371,6 +1376,7 @@ static void bios_io(struct hstore_c *hc, struct extent *extent)
 	int bios_queued = 0, on_endio_list = 0, writes = 0;
 	struct bio *bio;
 
+	/* Fatal if not uptodate! */
 	BUG_ON(!ExtentUptodate(extent));
 
 	/* Take io reference against premature endio while submitting bios. */
@@ -1387,7 +1393,9 @@ static void bios_io(struct hstore_c *hc, struct extent *extent)
 		 * Allow read during extent data IO but prohibit writes
 		 * for cache/original device data consistency reasons.
 		 */
-		if (write && ExtentCopying(extent)) {
+/* Test the difference! */
+//		if (write && ExtentCopying(extent)) {
+		if (write && ExtentCopyIo(extent)) {
 			bio_list_add_head(&extent->io.in, bio);
 			break;
 		}
@@ -1564,6 +1572,7 @@ static void do_endios(struct hstore_c *hc)
 				extent_to_core(extent);
 
 				/* Reset to enable access. */
+				ClearExtentCopyIo(extent);
 				ClearExtentMetaIo(extent);
 				ClearExtentCopying(extent);
 
@@ -1862,15 +1871,15 @@ static void do_dirty(struct hstore_c *hc)
 	 */
 	if (!CacheSuspend(hc) &&
 	    OrigWritable(hc)) {
-		unsigned max = parallel_dirty_max;
+		unsigned max = parallel_dirty_min;
 		struct list_head *pos, *tmp;
 
 		/* If busy, flush more aggressively. */
 		if (!extents_free(hc)) {
-			max *= 2;
+			max *= 10;
 
 			if (!atomic_read(&hc->extents.lru))
-				max *= 50;
+				max *= 20;
 		}
 
 		/* FIXME: all at once? */
@@ -1881,6 +1890,7 @@ static void do_dirty(struct hstore_c *hc)
 			if (atomic_read(&hc->extents.dirty_flushing) >= max)
 				break;
 
+			BUG_ON(ExtentCopyIo(extent));
 			BUG_ON(ExtentMetaIo(extent));
 			BUG_ON(ExtentCopying(extent));
 			extent_flush_add(extent);
