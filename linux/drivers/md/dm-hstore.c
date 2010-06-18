@@ -45,7 +45,7 @@
  *
  */
 
-static const char version[] = "0.285";
+static const char version[] = "0.295";
 
 #include "dm.h"
 
@@ -256,8 +256,8 @@ BITOPS(Extent, MetaIo, extent, EXTENT_META_IO)
 /* Development statistics. */
 struct stats {
 	atomic_t io[2];
-	atomic_t hits[2];
-	atomic_t misses[2];
+	atomic_t hit[2];
+	atomic_t miss[2];
 	atomic_t deferred_io[2];
 	atomic_t submitted_io[2];
 	atomic_t extent_copy_active;
@@ -269,7 +269,8 @@ struct stats {
 	atomic_t overwrite;
 	atomic_t endio_active;
 	atomic_t bios_requeued;
-	atomic_t writes_while_copying;
+	atomic_t read_through;
+	atomic_t write_while_copying;
 	atomic_t force_dirty;
 	atomic_t dropped_on_flush;
 	atomic_t merge_bvec_fn;
@@ -285,8 +286,8 @@ static void stats_init(struct stats *s)
 
 	while (i--) {
 		atomic_set(s->io + i, 0);
-		atomic_set(s->hits + i, 0);
-		atomic_set(s->misses + i, 0);
+		atomic_set(s->hit + i, 0);
+		atomic_set(s->miss + i, 0);
 		atomic_set(s->deferred_io + i, 0);
 		atomic_set(s->submitted_io + i, 0);
 		atomic_set(s->extent_data_io + i, 0);
@@ -300,7 +301,8 @@ static void stats_init(struct stats *s)
 	atomic_set(&s->overwrite, 0);
 	atomic_set(&s->endio_active, 0);
 	atomic_set(&s->bios_requeued, 0);
-	atomic_set(&s->writes_while_copying, 0);
+	atomic_set(&s->read_through, 0);
+	atomic_set(&s->write_while_copying, 0);
 	atomic_set(&s->force_dirty, 0);
 	atomic_set(&s->dropped_on_flush, 0);
 	atomic_set(&s->merge_bvec_fn, 0);
@@ -327,6 +329,7 @@ struct c_dev {
 struct hstore_c {
 	/* Extent hash. */
 	struct extent_hash hash;
+	struct mutex hash_lock;
 
 	struct {
 		spinlock_t lock;	/* Protects central input list above. */
@@ -638,16 +641,28 @@ static int multiple(sector_t a, sector_t b)
 	return a == r * b;
 }
 
-/* Derive hash key from bio sector. */
+/* Derive hash key from sector. */
+static inline sector_t _sector_to_key(struct hstore_c *hc, sector_t sector)
+{
+	return sector & hc->extents.mask;
+}
+
+/* Derive hash key from bio. */
 static inline sector_t _bio_to_key(struct hstore_c *hc, struct bio *bio)
 {
-	return bio->bi_sector & hc->extents.mask;
+	return _sector_to_key(hc, bio->bi_sector);
+}
+
+/* Derive offset within extent from sector. */
+static inline sector_t _sector_to_extent(struct hstore_c *hc, sector_t sector)
+{
+	return sector & hc->extents.mask_inv;
 }
 
 /* Derive offset within extent from bio. */
 static inline sector_t _bio_to_extent(struct hstore_c *hc, struct bio *bio)
 {
-	return bio->bi_sector & hc->extents.mask_inv;
+	return _sector_to_extent(hc, bio->bi_sector);
 }
 
 /*
@@ -777,11 +792,15 @@ static struct extent *hash_lookup(struct hstore_c *hc, sector_t key)
 	struct list_head *bucket = hash_bucket(&hc->hash, key);
 	struct extent *extent;
 
+	mutex_lock(&hc->hash_lock);
 	list_for_each_entry(extent, bucket, lists.hash) {
-		if (key == extent->addr.orig.key)
+		if (key == extent->addr.orig.key) {
+			mutex_unlock(&hc->hash_lock);
 			return extent;
+		}
 	}
 
+	mutex_unlock(&hc->hash_lock);
 	return NULL;
 }
 
@@ -1327,7 +1346,9 @@ static void extent_hash_insert(struct extent *extent)
 {
 	/* Delete before reinserting with new key. */
 	extent_hash_del(extent);
+	mutex_lock(&extent->hc->hash_lock);
 	hash_insert(&extent->hc->hash, extent);	/* Hash the extent. */
+	mutex_unlock(&extent->hc->hash_lock);
 
 	/* REMOVEME: stats. */
 	atomic_inc(&extent->hc->stats.extents_hashed);
@@ -1480,6 +1501,8 @@ static int cache_resize(struct hstore_c *hc)
 		}
 
 		todo = 0;
+
+		/* Adjust cache size for header update below. */
 		cache->size += count * extent_total_size(hc);
 	} else {
 		/*
@@ -1487,8 +1510,7 @@ static int cache_resize(struct hstore_c *hc)
 		 *	   Again to a private list first to be
 		 *	   able to stand a header write failure.
 		 */
-		/* One more to write the mandatory free one. */
-		count = todo = extents_old - extents + 1;
+		count = todo = extents_old - extents;
 		while (todo) {
 			/*
 			 * Check ordered list from the
@@ -1517,6 +1539,7 @@ static int cache_resize(struct hstore_c *hc)
 			DMWARN_LIMIT("Freeing %u extents of requested %u.",
 				     count - todo, count);
 
+		/* Adjust cache size for header update below. */
 		cache->size -= (count - todo) * extent_total_size(hc);
 	}
 
@@ -1531,22 +1554,24 @@ static int cache_resize(struct hstore_c *hc)
 	/* Update disk header with new cache size. */
 	if (CachePersistent(hc)) {
 		/*
-		 * We have to write *one* free extent for the cache
-		 * initialization to succeed in case we fail _after_
-		 * writing the header but before the worker starts
+		 * If we grow, we have to write *one* free extent for
+		 * the cache initialization to succeed in case we fail
+		 * _after_ writing the header but before the worker starts
 		 * initializing the new extents on disk.
 		 */
-		extent = list_first_entry(&list, struct extent, lists.ordered);
-		r = extent_write_free_header_sync(extent);
-		if (r) {
-			DMERR("FATAL: Error extent header to %s",
-			      cache->dev->name);
-			goto err_free;
+		if (grow) {
+			extent = list_first_entry(&list, struct extent,
+						  lists.ordered);
+			r = extent_write_free_header_sync(extent);
+			if (r) {
+				DMERR("FATAL: Error writing "
+				      "extent header to %s", cache->dev->name);
+				goto err_free;
+			}
 		}
 
 		hc->disk_header = metadata_alloc(hc);
 		BUG_ON(!hc->disk_header);
-
 		r = header_write(hc);
 		metadata_free(hc, (void **) &hc->disk_header);
 		if (r) {
@@ -1590,15 +1615,11 @@ static int cache_resize(struct hstore_c *hc)
 		SetCacheInitializeNew(hc);
 		SetCacheDoInitialize(hc);
 	} else {
-		int first = 1;
-
 	 	/*
 		 * Free any extents we shrunk the cache by pulling
-		 * them out of work list adjusting counters *but*
-		 * the first one listed.
+		 * them out of work list adjusting counters.
 		 */
-		list_for_each_entry_safe(extent, tmp, &list,
-					 lists.ordered) {
+		list_for_each_entry_safe(extent, tmp, &list, lists.ordered) {
 			list_del(&extent->lists.ordered);
 
 			/*
@@ -1608,18 +1629,11 @@ static int cache_resize(struct hstore_c *hc)
 			extent_hash_del(extent);
 			extent_free_init_lru_del(extent);
 
-			if (first) {
-				list_add_tail(&extent->lists.ordered,
-					      &hc->lists.ordered);
-				extent_free_init_lru_add(extent);
-				first = 0;
-				continue;
-			}
-
 			if (!ExtentInit(extent))
 				atomic_dec(&hc->extents.initialized);
 
 			atomic_dec(&hc->extents.total);
+			BUG_ON(!extent_is_idle(extent));
 			extent_free(extent);
 		}
 	}
@@ -1805,14 +1819,14 @@ static void extent_io_async(int rw, struct extent *extent)
 /* Return flush dirty extent flush delay in jiffies. */
 static unsigned long dirty_flush_delay(void)
 {
-	return jiffies + HZ;
+	return jiffies + 5 * HZ;
 }
 
 /* Process bios on an uptodate extent. */
 static void _bios_io(int rw, struct extent *extent)
 {
 	int copy_io, write = !!(rw == WRITE);
-	unsigned writes, writes_while_copying;
+	unsigned writes, write_while_copying;
 	struct bio *bio;
 	struct bio_list *bios = extent->io.in + write;
 	struct hstore_c *hc;
@@ -1822,7 +1836,7 @@ static void _bios_io(int rw, struct extent *extent)
 
 	hc = extent->hc;
 	copy_io = ExtentCopyIo(extent);
-	writes = writes_while_copying = 0;
+	writes = write_while_copying = 0;
 
 	/*
 	 * Remap all queued bios, take out an endio
@@ -1840,8 +1854,8 @@ static void _bios_io(int rw, struct extent *extent)
 
 			if (copy_io) {
 				/* REMOVEME: stats. */
-				atomic_inc(&hc->stats.writes_while_copying);
-				writes_while_copying = 1;
+				atomic_inc(&hc->stats.write_while_copying);
+				write_while_copying = 1;
 			}
 		}
 
@@ -1881,7 +1895,7 @@ static void _bios_io(int rw, struct extent *extent)
 				meta_io = 0;
 
 				/* Make sure extent gets redirtied. */
-				if (copy_io && writes_while_copying) {
+				if (copy_io && write_while_copying) {
 					SetExtentForceDirty(extent);
 					/* REMOVEME: stats. */
 					atomic_inc(&hc->stats.force_dirty);
@@ -1938,7 +1952,7 @@ static void extent_validate(struct extent *extent)
 
 	/*
 	 * Metadata read -> insert into hash if used, so that
-	 * hash hits for queued bios can start to happen in
+	 * hash hit for queued bios can start to happen in
 	 * do_bios()->_do_bios()->extent_get().
 	 */
 	if (ExtentMetaRead(extent)) {
@@ -2153,7 +2167,7 @@ static void do_endios(struct hstore_c *hc)
 		if (extent_has_bios_queued(extent))
 			/* There's bios pending -> put on flush list. */
 			extent_flush_add(extent);
-		 else if (ExtentDirty(extent))
+		else if (ExtentDirty(extent))
 			extent_dirty_add_sorted(extent);
  		else if (extent_is_idle(extent))
 			/* No bios and not dirty -> put on LRU list. */
@@ -2248,6 +2262,7 @@ static int _do_bios(int rw, struct hstore_c *hc)
 	struct bio_list *bios = hc->io.work + write;
 	struct extent *extent;
 
+
 	/* Work all deferred or new bios on work list. */
 	while ((bio = bio_list_pop(bios))) {
 		/* This is a fatal cache error so don't claim io succeeds. */
@@ -2271,7 +2286,7 @@ static int _do_bios(int rw, struct hstore_c *hc)
 		extent = extent_get(hc, bio);
 		if (extent) {
 			/* REMOVEME: stats */
-			atomic_inc(hc->stats.hits + write);
+			atomic_inc(hc->stats.hit + write);
 	
 			/* If extent is errored, error bio here. */
 			if (unlikely(ExtentError(extent)))
@@ -2279,17 +2294,28 @@ static int _do_bios(int rw, struct hstore_c *hc)
 			else {
 				/*
 				 * Put bio on extents input queue
-				 * and extent on flush list,
+				 * and extent on flush list unless
+				 * read and extent not uptodate,
 				 */
 				if (!write)
 					atomic_inc(&hc->io.reads);
 
-				bio_list_add(extent->io.in + write, bio);
+				if (ExtentUptodate(extent) || write)
+					bio_list_add(extent->io.in + write,
+						     bio);
+				else {
+					bio->bi_bdev = hc->devs.orig.dev->bdev;
+					SetCacheOrigIOQueued(hc);
+					submit_bio(READ, bio);
+					/* REMOVEME: stats */
+					atomic_inc(&hc->stats.read_through);
+				}
+
 				extent_flush_add(extent);
 			}
 		} else {
 			/* REMOVEME: stats */
-			atomic_inc(hc->stats.misses + write);
+			atomic_inc(hc->stats.miss + write);
 
 			/*
 			 * If we run out of LRU extents but can write
@@ -2300,7 +2326,6 @@ static int _do_bios(int rw, struct hstore_c *hc)
 				bio_endio(bio, -EIO);
 			else {
 				bio_list_add_head(bios, bio);
-				r = -ENOMEM;
 				break;
 			}
 		}
@@ -2396,6 +2421,8 @@ static void do_dirty(struct hstore_c *hc)
 {
 	unsigned free = extents_free(hc) + extents_lru(hc);
 
+// xXx flushing still not proper!!!
+
 	/* Can't flush dirty extents to non-writable origin device. */
 	if (!CacheOrigWritable(hc) ||
 	    CacheInitializationActive(hc) ||
@@ -2407,6 +2434,7 @@ static void do_dirty(struct hstore_c *hc)
 			 flushing_max = dirty_flushing_max(hc),
 			 free_min = extents_total(hc) / 2,
 			 this_flushing = 0;
+		unsigned long j;
 		struct extent *extent, *tmp;
 
 		if (flushing >= flushing_max)
@@ -2435,35 +2463,34 @@ static void do_dirty(struct hstore_c *hc)
 		 *   o and we don't have more than a minimum of free extents
 		 */
 
-		hc->io.dirty_expire = ~0;
+
+		/* Find next dirty flush delay. */
+		hc->io.dirty_expire = 0;
+		j = jiffies;
+		list_for_each_entry(extent, &hc->lists.dirty,
+				    lists.dirty_flush) {
+			unsigned long ede = extent->io.dirty_expire;
+
+			if (ede > j) {
+				hc->io.dirty_expire = ede - j;
+				break;
+			}
+		}
 
 		/* Submit maximum dirty extents to flush. */
 		list_for_each_entry_safe(extent, tmp, &hc->lists.dirty,
 					 lists.dirty_flush) {
-			/*
-			 * Wait until expired unless busy and
-			 * store delay for rescheduling to flush
-			 * next dirty extent(s).
-			 */
-			if (free > free_min) {
-				unsigned long ede = extent->io.dirty_expire,
-					      j = jiffies;
-
-				/* Get schedule to run worker again. */
-				if (ede > j) {
-					hc->io.dirty_expire = ede - j;
-					break;
-				}
-			}
-
-			if (this_flushing + flushing >= flushing_max)
+			if (this_flushing + flushing == flushing_max)
 				break;
 
-			BUG_ON(ExtentCopying(extent));
-			BUG_ON(ExtentCopyIo(extent));
-			BUG_ON(ExtentMetaIo(extent));
-			extent_flush_add(extent);
-			this_flushing++;
+			if (hc->io.dirty_expire < jiffies ||
+			    free < free_min) { // xXx remove ?
+				BUG_ON(ExtentCopying(extent));
+				BUG_ON(ExtentCopyIo(extent));
+				BUG_ON(ExtentMetaIo(extent));
+				extent_flush_add(extent);
+				this_flushing++;
+			}
 		}
 	}
 }
@@ -2507,7 +2534,10 @@ static void do_flush(struct hstore_c *hc)
 					/* REMOVEME: stats. */
 					atomic_inc(&hc->stats.dropped_on_flush);
 				else {
-					BUG_ON(!ExtentDirty(extent));
+					// BUG_ON(!ExtentDirty(extent));
+					if (!ExtentDirty(extent))
+						continue;
+
 					/* Write extent out to the origin. */
 					extent_io_async(WRITE, extent);
 					atomic_inc(&hc->extents.dirty_flushing);
@@ -2908,6 +2938,7 @@ context_create(struct dm_target *ti, char **argv,
 	hc->params.params = hstore_params;
 	hc->params.handle = handle;
 	hc->params.cache_size = cache_size;
+	mutex_init(&hc->hash_lock);
 	mutex_init(&hc->params.resize_lock);
 	hc->params.extent_size = extent_size;
 	hc->params.write_policy = write_policy;
@@ -3004,9 +3035,8 @@ context_create(struct dm_target *ti, char **argv,
 	 * in header differs from ctr parameter.
 	 */
 	if (cache_size && cache_size != hc->devs.cache.size) {
-		sector_t dsize = check_dev_access(hc, &hc->devs.cache, cache_size);
-
-		if (cache_size != dsize)
+		if (cache_size != check_dev_access(hc, &hc->devs.cache,
+						   cache_size))
 			TI_ERR_RET(-ENOMEM,
 				   "Invalid cache size; device too small");
 
@@ -3453,14 +3483,12 @@ static int hstore_message(struct dm_target *ti, unsigned argc, char **argv)
 }
 
 /* bvec merge method. */
-static int hstore_merge(struct dm_target *ti, struct bvec_merge_data *bvm,
-			struct bio_vec *biovec, int max_size)
+static int hstore_bvec_merge(struct dm_target *ti, struct bvec_merge_data *bvm,
+			     struct bio_vec *biovec, int max_size)
 {
+	int min_size;
 	struct hstore_c *hc = ti->private;
 	struct request_queue *q  = bdev_get_queue(hc->devs.cache.dev->bdev);
-
-	/* REMOVEME: stats. */
-	atomic_inc(&hc->stats.merge_bvec_fn);
 
 	if (!q->merge_bvec_fn)
 		return max_size;
@@ -3470,12 +3498,25 @@ static int hstore_merge(struct dm_target *ti, struct bvec_merge_data *bvm,
 	 *
 	 * What we can't tell from here is the sector offset because
 	 * that's the workers task to tell on requesting extents.
-	 * Best assumption is sector 0.
 	 */
-	bvm->bi_bdev = (CacheWriteThrough(hc) && bvm->bi_rw == WRITE) ?
-		       hc->devs.orig.dev->bdev : hc->devs.cache.dev->bdev;
-	bvm->bi_sector = 0;
-	return min(max_size, q->merge_bvec_fn(q, bvm, biovec));
+	if (CacheWriteThrough(hc) && bvm->bi_rw == WRITE)
+		bvm->bi_bdev = hc->devs.orig.dev->bdev;
+	else {
+		struct extent *extent =
+			hash_lookup(hc, _sector_to_key(hc, bvm->bi_sector));
+
+		bvm->bi_bdev = hc->devs.cache.dev->bdev;
+		bvm->bi_sector = extent ?
+				 extent->addr.cache.offset +
+				 _sector_to_extent(hc, bvm->bi_sector) : 0;
+	}
+
+	/* REMOVEME: stats. */
+	atomic_inc(&hc->stats.merge_bvec_fn);
+
+	min_size = min(max_size, q->merge_bvec_fn(q, bvm, biovec));
+	DMINFO_LIMIT("min_size=%d", min_size);
+	return min_size;
 }
 
 
@@ -3510,7 +3551,7 @@ static int hstore_status(struct dm_target *ti, status_type_t type,
 
 		if (CacheStatistics(hc))
 			DMEMIT(" es=%llu flgs=0x%lx bkts=%u r=%u/%u w=%u/%u "
-			     "h=%u/%u m=%u/%u wwc=%u dof=%u "
+			     "h=%u/%u m=%u/%u rt=%u wwc=%u dof=%u "
 			     "fd=%u rd=%u wd=%u rs=%u ws=%u ca=%u dr=%u dw=%u "
 			     "mr=%u mw=%u ec=%u ov=%u eioa=%u "
 			     "req=%u ef=%u el=%u ei=%u et=%u eh=%u "
@@ -3521,10 +3562,11 @@ static int hstore_status(struct dm_target *ti, status_type_t type,
 			     atomic_read(s->bios_endiod),
 			     atomic_read(s->io + 1),
 			     atomic_read(s->bios_endiod + 1),
-			     atomic_read(s->hits), atomic_read(s->hits + 1),
-			     atomic_read(s->misses),
-			     atomic_read(s->misses + 1),
-			     atomic_read(&s->writes_while_copying),
+			     atomic_read(s->hit), atomic_read(s->hit + 1),
+			     atomic_read(s->miss),
+			     atomic_read(s->miss + 1),
+			     atomic_read(&s->read_through),
+			     atomic_read(&s->write_while_copying),
 			     atomic_read(&s->dropped_on_flush),
 			     atomic_read(&s->force_dirty),
 			     atomic_read(s->deferred_io),
@@ -3619,7 +3661,7 @@ static struct target_type hstore_target = {
 	.postsuspend = hstore_postsuspend,
 	.resume = hstore_resume,
 	.message = hstore_message,
-	.merge = hstore_merge,
+	.merge = hstore_bvec_merge,
 	.status = hstore_status,
 	.io_hints = hstore_io_hints,
 };
