@@ -862,7 +862,10 @@ static void extent_endio_add(struct extent *extent)
 	spin_unlock_irqrestore(&hc->lists.lock_endio, flags);
 }
 
-/* Transfer extent representation to disk/core with sizes on disk in bytes. */
+/*
+ * Transfer extent representation to disk/core
+ * with sizes on disk in 512 byte unbits.
+ */
 static void extent_to_disk(struct extent *extent)
 {
 	struct extent_disk *ed = extent->disk;
@@ -870,9 +873,8 @@ static void extent_to_disk(struct extent *extent)
 	strncpy(ed->magic, extent_magic, sizeof(ed->magic));
 	ed->flags = cpu_to_le64(extent->io.flags);
 	ed->crc = ed->filler = 0;
-	ed->addr.cache_offset =
-		 cpu_to_le64(to_bytes(extent->addr.cache.offset));
-	ed->addr.orig_offset = cpu_to_le64(to_bytes(extent->addr.orig.offset));
+	ed->addr.cache_offset = cpu_to_le64(extent->addr.cache.offset);
+	ed->addr.orig_offset = cpu_to_le64(extent->addr.orig.offset);
 	ed->crc = cpu_to_le32(crc32(~0, ed, sizeof(*ed)));
 }
 
@@ -881,9 +883,8 @@ static void extent_to_core(struct extent *extent)
 	struct extent_disk *ed = extent->disk;
 
 	extent->io.flags = le64_to_cpu(ed->flags);
-	extent->addr.cache.offset =
-		to_sector(le64_to_cpu(ed->addr.cache_offset));
-	extent->addr.orig.offset = to_sector(le64_to_cpu(ed->addr.orig_offset));
+	extent->addr.cache.offset = le64_to_cpu(ed->addr.cache_offset);
+	extent->addr.orig.offset = le64_to_cpu(ed->addr.orig_offset);
 	ed->crc = le32_to_cpu(ed->crc);
 }
 
@@ -1064,15 +1065,18 @@ static int header_io_sync(struct hstore_c *hc, int rw)
 		  hc->devs.cache.start, NULL, NULL);
 }
 
-/* Transfer cache device header from/to CPU with sizes on disk in bytes. */
+/*
+ * Transfer cache device header from/to CPU
+ * with sizes on disk in 512 byte units.i
+ */
 static void header_to_disk(struct hstore_c *hc)
 {
 	struct disk_header *dh = hc->disk_header;
 
 	dh->crc = 0;
 	dh->crc = cpu_to_le32(crc32(~0, dh, sizeof(*dh)));
-	dh->size.dev = cpu_to_le64(to_bytes(dh->size.dev));
-	dh->size.extent = cpu_to_le64(to_bytes(dh->size.extent));
+	dh->size.dev = cpu_to_le64(dh->size.dev);
+	dh->size.extent = cpu_to_le64(dh->size.extent);
 	dh->flags = cpu_to_le64(dh->flags);
 }
 
@@ -1081,8 +1085,8 @@ static void header_to_core(struct hstore_c *hc)
 	struct disk_header *dh = hc->disk_header;
 
 	dh->crc = le32_to_cpu(dh->crc);
-	dh->size.dev = to_sector(le64_to_cpu(dh->size.dev));
-	dh->size.extent = to_sector(le64_to_cpu(dh->size.extent));
+	dh->size.dev = le64_to_cpu(dh->size.dev);
+	dh->size.extent = le64_to_cpu(dh->size.extent);
 	dh->flags = cpu_to_le64(dh->flags);
 }
 
@@ -1902,8 +1906,6 @@ static void _bios_io(int rw, struct extent *extent)
 				}
 			} else {
 				extent->io.dirty_expire = dirty_flush_delay();
-
-				/* REMOVEME: stats */
 				atomic_inc(&hc->extents.dirty);
 			}
 		}
@@ -1999,8 +2001,6 @@ static void extent_validate(struct extent *extent)
 					extent->io.dirty_expire =
 						dirty_flush_delay();
 					extent_dirty_add_sorted(extent);
-
-					/* REMOVEME: stats */
 					atomic_inc(&hc->extents.dirty); 
 				}
 			} /* Else put on LRU list below. */
@@ -2144,8 +2144,6 @@ static void do_endios(struct hstore_c *hc)
 				 */
 				BUG_ON(!ExtentUptodate(extent));
 				atomic_dec(&hc->extents.dirty_flushing);
-
-				/* REMOVEME: stats. */
 				atomic_dec(&hc->extents.dirty); 
 			}
 		}
@@ -2155,8 +2153,6 @@ static void do_endios(struct hstore_c *hc)
 		    TestClearExtentForceDirty(extent)) {
 			SetExtentDirty(extent);
 			extent->io.dirty_expire = dirty_flush_delay();
-
-			/* REMOVEME: stats. */
 			atomic_inc(&hc->extents.dirty); 
 		}
 
@@ -2167,9 +2163,11 @@ static void do_endios(struct hstore_c *hc)
 		if (extent_has_bios_queued(extent))
 			/* There's bios pending -> put on flush list. */
 			extent_flush_add(extent);
-		else if (ExtentDirty(extent))
+		else if (ExtentDirty(extent)) {
 			extent_dirty_add_sorted(extent);
- 		else if (extent_is_idle(extent))
+// xXx atomic updated wrong! check all instances where it gets added to the dirty list.
+			atomic_inc(&hc->extents.dirty); 
+ 		} else if (extent_is_idle(extent))
 			/* No bios and not dirty -> put on LRU list. */
 			extent_free_init_lru_add(extent);
 	}
@@ -2571,10 +2569,13 @@ static void do_flush(struct hstore_c *hc)
  */
 static void do_reschedule(struct hstore_c *hc)
 {
+// xXx dirty extents not being flushed on cold cache!!!
 	if (!work_pending(&hc->io.ws.work) &&
-	    extents_dirty(hc) &&
-	    hc->io.dirty_expire < ~0)
+	    extents_dirty(hc))
+{
+DMINFO_LIMIT("%s %lu", __func__, hc->io.dirty_expire);
 		wake_do_hstore_delayed(hc, hc->io.dirty_expire);
+}
 }
 
 /* Wake up any waiters in case we're idle. */
@@ -3144,7 +3145,7 @@ context_create(struct dm_target *ti, char **argv,
  *
  * #variable_params = 0-6
  *
- * params = {auto/create/open} [cache_check_dev_access( [#cache_extent_size \
+ * params = {auto/create/open} [cache_size [cache_extent_size \
  *	     [-/readwrite/readonly \
  *	     [-/writeback/writethrough \
  *           [-/persistent/transient]]]]]
@@ -3153,11 +3154,11 @@ context_create(struct dm_target *ti, char **argv,
  *
  * 'auto' causes open of a cache with a valid header or
  * creation of a new cache if there's no vaild one sized to
- * cache_check_dev_access(.
- * If 'auto' is being used on a non-existing cache without cache_check_dev_access(
- * or cache_check_dev_access( = 0, the constructor fails.
+ * cache_size.
+ * If 'auto' is being used on a non-existing cache without cache_size
+ * or cache_size = 0, the constructor fails.
  *
- * 'create' enforces creation of a new cache with cache_check_dev_access(.
+ * 'create' enforces creation of a new cache with cache_size.
  * WARNING: this overwrites an existing cache!!!
  *
  * 'open' requires a valid cache to exist. No new one will be
@@ -3168,12 +3169,12 @@ context_create(struct dm_target *ti, char **argv,
  * 1 + 'open': equal to '0'
  * 1 + 'auto': equal to '0'
  * 2 + 'open': the cache device must be initialized and resizing will
- *	       get tried to cache_check_dev_access(. cache_check_dev_access( = 0 doesn't
+ *	       get tried to cache_size. cache_size = 0 doesn't
  *	       change the cache size.
  * 2 + 'create': the cache device will get initialized and sized
- *	         to cache_check_dev_access(.
+ *	         to cache_size.
  * 2 + 'auto': the cache device will either be opened and tried to resize
- * 	       or get initialized and sized to cache_check_dev_access(.
+ * 	       or get initialized and sized to cache_size.
  * 3: on create (either implicit or via 'auto'),
  *    this cache_extens_size will be used.
  * 4: the origin device will be opened read only/read write,
@@ -3454,6 +3455,7 @@ static int msg_statistics(struct hstore_c *hc, char *arg)
 
 	return r;
 }
+
 /* Message method. */
 static int hstore_message(struct dm_target *ti, unsigned argc, char **argv)
 {
